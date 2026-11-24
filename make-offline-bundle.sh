@@ -47,15 +47,22 @@ tar -xzf "$TMP/u2r.tar.gz" -C "$TMP"
 install -m 0755 "$TMP/$U2R_BIN" "$CORES_DIR/udp2raw"
 ok "Bundled udp2raw -> cores/udp2raw"
 
-OUT_ZIP="$(dirname "$SRC_DIR")/kerov-tunnel-full-offline.zip"
+OUT_DIR="${KEROV_OUT_DIR:-$(dirname "$SRC_DIR")}"
+mkdir -p "$OUT_DIR"
+OUT_DIR="$(cd "$OUT_DIR" && pwd -P)"
+OUT_ZIP="$OUT_DIR/kerov-tunnel-full-offline.zip"
 rm -f "$OUT_ZIP"
-(cd "$(dirname "$SRC_DIR")" && zip -qr "$OUT_ZIP" "$(basename "$SRC_DIR")")
+STAGE=$(mktemp -d)
+mkdir -p "$STAGE/kerov-tunnel"
+(cd "$SRC_DIR" && tar --exclude=.git --exclude=__pycache__ -cf - .) | tar -xf - -C "$STAGE/kerov-tunnel"
+(cd "$STAGE" && zip -qr "$OUT_ZIP" kerov-tunnel)
+rm -rf "$STAGE"
 ok "100% Offline bundle created: $OUT_ZIP"
 
 PUB_IP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}' | head -1)
 echo ""
 echo -e "${C_Y}  Now transfer $OUT_ZIP to your Iran server, or run this one-time HTTP server here:${C_N}"
-echo -e "  ${C_C}  (cd $(dirname "$SRC_DIR") && python3 -m http.server 8899)${C_N}"
+echo -e "  ${C_C}  (cd $OUT_DIR && python3 -m http.server 8899)${C_N}"
 echo -e "${C_Y}  And on your IRAN server run:${C_N}"
 echo -e "  ${C_G}  wget http://${PUB_IP}:8899/kerov-tunnel-full-offline.zip && unzip kerov-tunnel-full-offline.zip && cd kerov-tunnel && sudo bash kerov-install.sh${C_N}"
 echo ""

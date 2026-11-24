@@ -2427,24 +2427,28 @@ def benchmark_menu():
         results.sort(key=lambda x: x["score"], reverse=True)
         max_spd = max((r["mbps"] for r in results), default=100.0) or 100.0
 
-        rtbl = Table(title="SMART BENCHMARK PRO — RANKING (BEST TO WORST)", box=box.ROUNDED, border_style="green", expand=True)
-        rtbl.add_column("Rank", style="bold yellow", width=5)
-        rtbl.add_column("Engine", style="bold magenta")
-        rtbl.add_column("Transport", style="bold cyan")
-        rtbl.add_column("DL / UL Speed", style="bold green")
-        rtbl.add_column("Speed Bar", width=12)
-        rtbl.add_column("RTT / Jit", style="white")
-        rtbl.add_column("Loss", style="dim", width=6)
-        rtbl.add_column("Grade", width=7)
+        rtbl = Table(
+            title="[bold white on green]  SMART BENCHMARK PRO — RANKING (BEST TO WORST)  [/]",
+            box=box.HEAVY_HEAD, border_style="bold green", header_style="bold white on dark_green",
+            expand=True, show_lines=True, padding=(0, 2), min_width=110,
+        )
+        rtbl.add_column("Rank", style="bold yellow", min_width=6, no_wrap=True, justify="center")
+        rtbl.add_column("Engine", style="bold magenta", min_width=12, no_wrap=True)
+        rtbl.add_column("Transport", style="bold cyan", min_width=16, no_wrap=True)
+        rtbl.add_column("DL / UL Speed", style="bold green", min_width=22, no_wrap=True)
+        rtbl.add_column("Speed Bar", min_width=22, no_wrap=True)
+        rtbl.add_column("RTT / Jitter", style="bold white", min_width=16, no_wrap=True)
+        rtbl.add_column("Loss", style="bold", min_width=6, no_wrap=True, justify="center")
+        rtbl.add_column("Grade", min_width=8, no_wrap=True, justify="center")
         for rank, r in enumerate(results, 1):
             grade = _grade_badge(r["mbps"], r["rtt"], r["loss"])
             if r["mbps"] <= 0 and r["loss"] == 100:
-                rtbl.add_row(f"#{rank}", r["engine"], r["transport"], "[red]FAILED[/]", "[dim]░░░░░░░░░░[/]", "-", "100%", grade)
+                rtbl.add_row(f"#{rank}", r["engine"], r["transport"], "[red]FAILED[/]", "[dim]" + "░" * 18 + "[/]", "-", "100%", grade)
             else:
                 rtbl.add_row(
                     f"#{rank}", r["engine"], r["transport"],
                     f"↓{r['mbps']:.0f} / ↑{r.get('ul_mbps',0):.0f} Mbps",
-                    _speed_bar(r["mbps"], max_spd, 10),
+                    _speed_bar(r["mbps"], max_spd, 18),
                     f"{r['rtt']:.0f}ms / {r['jitter']:.0f}ms",
                     f"{r['loss']:.0f}%",
                     grade,

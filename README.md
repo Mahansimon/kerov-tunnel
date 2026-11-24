@@ -21,8 +21,8 @@ curl -fsSL https://raw.githubusercontent.com/Mahansimon/kerov-tunnel/main/setup-
 
 Offline (Iran server without GitHub access):
 ```bash
-# On the foreign server
-sudo bash make-offline-bundle.sh
+# On the foreign server (creates ./kerov-tunnel-full-offline.zip in the current directory)
+curl -fsSL https://raw.githubusercontent.com/Mahansimon/kerov-tunnel/main/setup-kerov.sh | sudo bash -s -- --offline
 # Copy kerov-tunnel-full-offline.zip to the Iran server, then:
 unzip kerov-tunnel-full-offline.zip && cd kerov-tunnel && sudo bash kerov-install.sh
 ```
