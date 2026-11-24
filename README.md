@@ -13,8 +13,9 @@ Multi-core tunnel manager & smart benchmark CLI for Ubuntu 22.04+.
   - Kerov-UDP Special (udp2raw FakeTCP + WireGuard)
 
 ## Quick Setup
+
+Run this command on your Ubuntu server:
+
 ```bash
-apt update && apt install -y unzip
-unzip -o kerov-tunnel-v4.zip && cd kerov-tunnel
-sudo bash kerov-install.sh
+curl -fsSL https://raw.githubusercontent.com/Mahansimon/kerov-tunnel/main/setup-kerov.sh | sudo bash
 ```
