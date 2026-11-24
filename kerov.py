@@ -40,8 +40,7 @@ from pathlib import Path
 import psutil
 import yaml
 from rich import box
-from rich.align import Align
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
@@ -338,64 +337,170 @@ def _sample_net_mbps(interval: float = 0.25):
     return max(0.0, rx), max(0.0, tx)
 
 
+UI_MAX_W = 80
+KEROV_VERSION = "v2.2"
+GOLD = ("#fff1b8", "#ffe08a", "#f5c542", "#e6b422", "#d4a017", "#a8790f")
+G_DIM = "#6b5a2e"
+CREAM = "#f3e9d2"
+MUTED = "#7a7a88"
+OK_C = "#4ade80"
+BAD_C = "#f87171"
+LOGO = (
+    "██╗  ██╗███████╗██████╗  ██████╗ ██╗   ██╗",
+    "██║ ██╔╝██╔════╝██╔══██╗██╔═══██╗██║   ██║",
+    "█████╔╝ █████╗  ██████╔╝██║   ██║██║   ██║",
+    "██╔═██╗ ██╔══╝  ██╔══██╗██║   ██║╚██╗ ██╔╝",
+    "██║  ██╗███████╗██║  ██║╚██████╔╝ ╚████╔╝ ",
+    "╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝   ╚═══╝  ",
+)
+CHIP_STYLES = {
+    "ok": "bold #86efac on #14532d",
+    "bad": "bold #fda4af on #4c0519",
+    "off": "bold #a1a1aa on #27272a",
+    "info": "bold #f5e3b0 on #3b2f12",
+}
+
+
+def _ui_width() -> int:
+    size = shutil.get_terminal_size((80, 24))
+    w = max(60, min(size.columns, UI_MAX_W))
+    console.width = w
+    return w
+
+
+def _ui_compact() -> bool:
+    return shutil.get_terminal_size((80, 24)).lines < 30 or console.width < 72
+
+
+def _chip(label: str, state: str) -> Text:
+    return Text(f" {label} ", style=CHIP_STYLES[state])
+
+
+def _gold_bar(pct: float, width: int = 10) -> Text:
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100.0 * width))
+    t = Text(no_wrap=True)
+    t.append("━" * filled, style=GOLD[2])
+    t.append("━" * (width - filled), style="#2a2a33")
+    return t
+
+
+def _grade_letter(mbps: float, rtt: float) -> str:
+    if mbps >= 150 and rtt < 60:
+        return "A+"
+    if mbps >= 80:
+        return "A"
+    if mbps >= 40:
+        return "B"
+    if mbps >= 15:
+        return "C"
+    return "D"
+
+
+def _last_winner():
+    if not BENCH_HISTORY.exists():
+        return None
+    try:
+        hist = json.loads(BENCH_HISTORY.read_text(encoding="utf-8"))
+        return hist[0] if hist else None
+    except Exception:
+        return None
+
+
 def _render_gradient_banner():
-    lines = BANNER.strip("\n").splitlines()
-    styles = ["bold bright_cyan", "bold cyan", "bold medium_purple1"]
-    for idx, line in enumerate(lines):
-        console.print(Align.center(Text(line, style=styles[idx % len(styles)])))
+    t = Text(no_wrap=True)
+    for i, row in enumerate(LOGO):
+        t.append(row.ljust(42), style=f"bold {GOLD[i]}")
+        if i < len(LOGO) - 1:
+            t.append("\n")
+    return t
+
+
+def _tagline(os_name: str) -> Text:
+    t = Text(no_wrap=True, overflow="ellipsis")
+    t.append("T U N N E L\n", style=f"bold {CREAM}")
+    t.append("─" * 13 + "\n", style=G_DIM)
+    t.append("◆ ", style=GOLD[2])
+    t.append("PRO EDITION\n", style=f"bold {GOLD[2]}")
+    t.append(f"{KEROV_VERSION} · 6 cores\n", style=MUTED)
+    t.append(os_name, style=MUTED)
+    return t
 
 
 def render_footer_bar(hints: str = None):
-    if not hints:
-        hints = (
-            "[bold cyan][1/C][/] Create  [dim]│[/]  "
-            "[bold cyan][2/M][/] Manage  [dim]│[/]  "
-            "[bold magenta][3/B][/] Benchmark  [dim]│[/]  "
-            "[bold cyan][4/L][/] Live HUD  [dim]│[/]  "
-            "[bold magenta][5/W][/] Watchdog  [dim]│[/]  "
-            "[bold cyan][6/T][/] Toolkit  [dim]│[/]  "
-            "[bold cyan][7/S][/] Status  [dim]│[/]  "
-            "[bold red][0/Q][/] Quit"
-        )
-    console.print(Panel(Align.center(hints), border_style="medium_purple1", box=box.ROUNDED, padding=(0, 1)))
+    text = Text(hints or "01-08 select · C M B L W T S shortcuts · Q quit", style=MUTED, justify="right", no_wrap=True, overflow="ellipsis")
+    console.print(text, justify='right')
 
 
 def render_header():
+    w = _ui_width()
     console.clear()
-    _render_gradient_banner()
-    subtitle = Text("━━  v2.2 PRO • 6-Core Tunnel Suite • Smart Benchmark • Watchdog • Live HUD  ━━", style="bold medium_purple1")
-    console.print(Align.center(subtitle))
-    console.print()
 
     tunnels = list_tunnels()
     online = sum(1 for t in tunnels if t["status"] == "active")
     cpu_pct = psutil.cpu_percent(interval=0.1)
     mem = psutil.virtual_memory()
     rx_mbps, tx_mbps = _sample_net_mbps(0.15)
-    bbr = run_cmd("sysctl -n net.ipv4.tcp_congestion_control").stdout.strip() or "unknown"
+    bbr = run_cmd(["sysctl", "-n", "net.ipv4.tcp_congestion_control"]).stdout.strip()
     wd_active = run_cmd(["systemctl", "is-active", "kerov-watchdog"]).stdout.strip() == "active"
-    wd_badge = "[bold green]● ACTIVE[/]" if wd_active else "[dim]○ OFF[/]"
     installed_cores = sum(
         1 for k in ("brokennode", "dagger", "backhaul", "paqet", "udp2raw", "ipsec")
         if os.path.exists(BINS[k])
     )
+    os_name = get_os_name().replace(" LTS", "")
 
-    info_grid = Table.grid(expand=True, padding=(0, 2))
-    info_grid.add_column(ratio=1)
-    info_grid.add_column(ratio=1)
-    info_grid.add_row(
-        f"[bold cyan]🌐 IP:[/] [white]{get_public_ip()}[/]  [dim]({bbr})[/]",
-        f"[bold medium_purple1]💻 OS:[/] [white]{get_os_name()}[/]",
-    )
-    info_grid.add_row(
-        f"[bold cyan]⚡ CPU:[/] {_mini_bar(cpu_pct, 12, 'cyan')} [white]{cpu_pct:4.0f}%[/] [dim]({psutil.cpu_count()}c)[/]",
-        f"[bold medium_purple1]🔥 RAM:[/] {_mini_bar(mem.percent, 12, 'magenta')} [white]{mem.used/1e9:.1f}/{mem.total/1e9:.1f} GB[/]",
-    )
-    info_grid.add_row(
-        f"[bold cyan]📡 Net:[/] [bold green]↓ {rx_mbps:.1f} Mbps[/]  [bold magenta]↑ {tx_mbps:.1f} Mbps[/]",
-        f"[bold medium_purple1]🛡️ Watchdog:[/] {wd_badge}  [dim]│[/]  [bold cyan]Cores:[/] [bold green]{installed_cores}/6[/]  [dim]│[/]  [bold cyan]Tunnels:[/] [bold green]{online}[/][dim]/{len(tunnels)}[/]",
-    )
-    console.print(Panel(info_grid, title="[bold cyan]⚡ KEROV v2.2 — SYSTEM HUD[/]", border_style="cyan", box=box.ROUNDED))
+    if _ui_compact():
+        top = Text(no_wrap=True, overflow="ellipsis")
+        top.append("◆ ", style=GOLD[2])
+        top.append("K E R O V", style=f"bold {GOLD[1]}")
+        top.append("  T U N N E L", style=f"bold {CREAM}")
+        top.append(f"   PRO · {KEROV_VERSION} · {os_name}", style=MUTED)
+    else:
+        top = Table.grid(padding=(0, 3))
+        top.add_column(no_wrap=True)
+        top.add_column(vertical="middle", no_wrap=True, overflow="ellipsis")
+        top.add_row(_render_gradient_banner(), _tagline(os_name))
+
+    if tunnels:
+        tun_state = "ok" if online == len(tunnels) else "bad"
+    else:
+        tun_state = "off"
+    chips = Text(no_wrap=True, overflow="ellipsis")
+    chips.append_text(_chip(f"● ONLINE {online}/{len(tunnels)}", tun_state))
+    chips.append(" ")
+    chips.append_text(_chip("● WATCHDOG", "ok" if wd_active else "off"))
+    chips.append(" ")
+    chips.append_text(_chip("● BBR", "ok" if bbr == "bbr" else "off"))
+    chips.append(" ")
+    chips.append_text(_chip(f"CORES {installed_cores}/6", "ok" if installed_cores == 6 else "info"))
+
+    row1 = Table.grid(expand=True)
+    row1.add_column(no_wrap=True)
+    row1.add_column(justify="right", no_wrap=True, overflow="ellipsis")
+    row1.add_row(chips, Text(get_public_ip(), style=f"bold {CREAM}"))
+
+    usage = Text(no_wrap=True)
+    usage.append("CPU ", style=MUTED)
+    usage.append_text(_gold_bar(cpu_pct))
+    usage.append(f" {cpu_pct:3.0f}%", style=CREAM)
+    usage.append("   RAM ", style=MUTED)
+    usage.append_text(_gold_bar(mem.percent))
+    usage.append(f" {mem.percent:3.0f}%", style=CREAM)
+    net = Text(no_wrap=True)
+    net.append(f"▼ {rx_mbps:.1f}", style=f"bold {OK_C}")
+    net.append("  ")
+    net.append(f"▲ {tx_mbps:.1f}", style=f"bold {GOLD[2]}")
+    net.append(" Mbps", style=MUTED)
+    row2 = Table.grid(expand=True)
+    row2.add_column(no_wrap=True)
+    row2.add_column(justify="right", no_wrap=True)
+    row2.add_row(usage, net)
+
+    divider = Text("─" * (w - 4), style=G_DIM, no_wrap=True)
+    console.print(Panel(
+        Group(top, divider, row1, row2),
+        box=box.DOUBLE, border_style=GOLD[5], width=w, padding=(0, 1),
+    ))
 
 def pause():
     flush_stdin()
@@ -2057,7 +2162,7 @@ def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=N
     eng = best["engine"]
     tr = best["transport"]
     console.print(Panel(
-        f"[bold green]🚀 1-CLICK DEPLOY WINNER:[/] [bold white]{eng.upper()}[/] → [bold cyan]{tr}[/]\n"
+        f"[bold green]1-CLICK DEPLOY WINNER:[/] [bold white]{eng.upper()}[/] → [bold cyan]{tr}[/]\n"
         f"[dim]Iran IP: {iran_ip}   Foreign IP: {foreign_ip}[/]",
         border_style="green", box=box.ROUNDED
     ))
@@ -2158,11 +2263,11 @@ def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=N
 def benchmark_menu():
     render_header()
     console.print(Panel(
-        "[bold cyan][1] 🚀 Iran Server (Coordinator)[/]   [dim]Generates [cyan]kerov-test://[/] link & measures DL/UL, RTT, Jitter, Grade[/]\n"
-        "[bold green][2] 📡 Foreign Server (Agent)[/]      [dim]Paste [cyan]kerov-test://[/] link — auto-syncs & runs all tests[/]\n"
+        "[bold cyan][1] Iran Server (Coordinator)[/]   [dim]Generates [cyan]kerov-test://[/] link & measures DL/UL, RTT, Jitter, Grade[/]\n"
+        "[bold green][2] Foreign Server (Agent)[/]      [dim]Paste [cyan]kerov-test://[/] link — auto-syncs & runs all tests[/]\n"
         "[bold yellow][3] 📜 Benchmark History[/]           [dim]View & compare past benchmark rankings[/]\n"
         "[dim][0] Back to Main Menu[/]",
-        title="[bold magenta]🏆 SMART BENCHMARK PRO — ALL 6 CORES & TRANSPORTS[/]", border_style="magenta", box=box.ROUNDED
+        title="[bold magenta]SMART BENCHMARK PRO — ALL 6 CORES & TRANSPORTS[/]", border_style="magenta", box=box.ROUNDED
     ))
     c = Prompt.ask("[bold cyan]kerov > Select[/]", choices=["0", "1", "2", "3"], default="1")
     if c == "0":
@@ -2322,7 +2427,7 @@ def benchmark_menu():
         results.sort(key=lambda x: x["score"], reverse=True)
         max_spd = max((r["mbps"] for r in results), default=100.0) or 100.0
 
-        rtbl = Table(title="🏆 SMART BENCHMARK PRO — RANKING (BEST TO WORST)", box=box.ROUNDED, border_style="green", expand=True)
+        rtbl = Table(title="SMART BENCHMARK PRO — RANKING (BEST TO WORST)", box=box.ROUNDED, border_style="green", expand=True)
         rtbl.add_column("Rank", style="bold yellow", width=5)
         rtbl.add_column("Engine", style="bold magenta")
         rtbl.add_column("Transport", style="bold cyan")
@@ -2355,7 +2460,7 @@ def benchmark_menu():
                 "winner": best,
             })
             send_telegram_alert(
-                f"🏆 <b>Kerov Benchmark Complete</b> ({mode_name})\n"
+                f"<b>Kerov Benchmark Complete</b> ({mode_name})\n"
                 f"Winner: <b>{best['engine'].upper()} / {best['transport']}</b>\n"
                 f"Speed: ↓{best['mbps']:.1f} / ↑{best.get('ul_mbps',0):.1f} Mbps | RTT: {best['rtt']:.1f} ms"
             )
@@ -2467,14 +2572,14 @@ def live_monitor_menu():
         net_panel = Panel(
             f"[bold green]↓ RX (Download):[/] [bold white]{rx:6.2f} Mbps[/]   {_sparkline(rx_hist, 'green', 34)}\n"
             f"[bold magenta]↑ TX (Upload):  [/] [bold white]{tx:6.2f} Mbps[/]   {_sparkline(tx_hist, 'magenta', 34)}\n\n"
-            f"[bold cyan]⚡ CPU:[/] {_mini_bar(cpu, 14, 'cyan')} {cpu:4.1f}%   "
+            f"[bold cyan]CPU:[/] {_mini_bar(cpu, 14, 'cyan')} {cpu:4.1f}%   "
             f"[bold cyan]🧠 RAM:[/] {_mini_bar(mem.percent, 14, 'magenta')} {mem.used/1e9:.1f}/{mem.total/1e9:.1f} GB   "
             f"[bold cyan]🔗 Conns:[/] [white]{conns}[/]",
-            title="[bold cyan]📡 LIVE TRAFFIC & RESOURCES (Press Ctrl+C to Exit)[/]",
+            title="[bold cyan]LIVE TRAFFIC & RESOURCES (Press Ctrl+C to Exit)[/]",
             border_style="cyan", box=box.ROUNDED
         )
 
-        tbl = Table(title="🛡️ ACTIVE TUNNEL HEALTH", box=box.ROUNDED, border_style="magenta", expand=True)
+        tbl = Table(title="ACTIVE TUNNEL HEALTH", box=box.ROUNDED, border_style="magenta", expand=True)
         tbl.add_column("Name", style="bold white")
         tbl.add_column("Engine", style="magenta")
         tbl.add_column("Transport", style="cyan")
@@ -2539,7 +2644,7 @@ def watchdog_menu():
             "[green][1] Enable / Start Watchdog[/]     [yellow][2] Disable / Stop Watchdog[/]\n"
             "[cyan][3] Set Check Interval (sec)[/]     [magenta][4] Configure Telegram Bot Alerts[/]\n"
             "[white][5] Send Test Telegram Alert[/]    [dim][0] Back to Main Menu[/]",
-            title="[bold cyan]🛡️ SMART WATCHDOG & TELEGRAM ALERTS[/]", border_style="cyan", box=box.ROUNDED
+            title="[bold cyan]SMART WATCHDOG & TELEGRAM ALERTS[/]", border_style="cyan", box=box.ROUNDED
         ))
         ch = Prompt.ask("Action", choices=["0", "1", "2", "3", "4", "5"], default="0")
         if ch == "0":
@@ -2671,7 +2776,7 @@ def network_toolkit_menu():
         console.print(Panel(
             "[bold cyan][1] 📏 Smart MTU Finder[/]            [dim]Find exact optimal MTU to Foreign server (prevents freeze)[/]\n"
             "[bold cyan][2] 💾 Backup / Restore Tunnels[/]    [dim]1-Click export/import all Kerov configs & services[/]\n"
-            "[bold cyan][3] 🔥 Kernel & Firewall Optimizer[/] [dim]Apply BBR + TCP Fast Open + open tunnel ports[/]\n"
+            "[bold cyan][3] Kernel & Firewall Optimizer[/] [dim]Apply BBR + TCP Fast Open + open tunnel ports[/]\n"
             "[dim][0] Back to Main Menu[/]",
             title="[bold cyan]🔧 NETWORK TOOLKIT[/]", border_style="cyan", box=box.ROUNDED
         ))
@@ -2774,35 +2879,91 @@ def uninstall_kerov():
 #  MAIN MENU LOOP
 # ==============================================================================
 
-def _build_side_status_panel() -> Panel:
-    tunnels = list_tunnels()
-    lines = []
-    if tunnels:
-        for t in tunnels[:6]:
-            dot = "[bold green]● ONLINE[/]" if t["status"] == "active" else f"[bold red]○ {t['status'].upper()}[/]"
-            lines.append(f"  {dot}  [bold white]{t['name']}[/] [dim]({t['engine']}/{t['transport']})[/]")
-        if len(tunnels) > 6:
-            lines.append(f"  [dim]... +{len(tunnels) - 6} more tunnels[/]")
-    else:
-        lines.append("  [dim]No tunnels configured yet.[/]")
-        lines.append("  [dim]Press [1] or [C] to create one.[/]")
+MAIN_MENU_LEFT = (
+    ("01", "Create Tunnel", "rev·direct"),
+    ("02", "Manage Tunnels", "logs·sync"),
+    ("03", "Smart Benchmark", "dl/ul"),
+    ("04", "Live Monitor", "realtime"),
+)
+MAIN_MENU_RIGHT = (
+    ("05", "Watchdog & Alerts", "telegram"),
+    ("06", "Network Toolkit", "mtu·bbr"),
+    ("07", "Core Status", "engines"),
+    ("08", "Uninstall", ""),
+)
 
-    lines.append("")
-    lines.append("[bold medium_purple1]🏆 LAST BENCHMARK WINNER[/]")
-    winner_line = "  [dim]No benchmark run yet ([3/B])[/]"
-    if BENCH_HISTORY.exists():
-        try:
-            hist = json.loads(BENCH_HISTORY.read_text(encoding="utf-8"))
-            if hist:
-                w = hist[0].get("winner", {})
-                winner_line = (
-                    f"  [bold green]★ {w.get('engine','').upper()}[/] → [bold cyan]{w.get('transport','')}[/]\n"
-                    f"  [dim]↓{w.get('mbps',0):.0f} / ↑{w.get('ul_mbps',0):.0f} Mbps • {w.get('rtt',0):.0f}ms ({hist[0].get('ts','')})[/]"
-                )
-        except Exception:
-            pass
-    lines.append(winner_line)
-    return Panel("\n".join(lines), title="[bold medium_purple1]📡 TUNNEL HEALTH & WINNER[/]", border_style="medium_purple1", box=box.ROUNDED)
+
+def _section_title(title: str, width: int = 0) -> Text:
+    t = Text(no_wrap=True, overflow="crop")
+    t.append(" ◆ ", style=GOLD[2])
+    t.append(title, style=f"bold {GOLD[2]}")
+    if width:
+        t.append(" " + "─" * max(0, width - len(title) - 5), style=G_DIM)
+    return t
+
+
+def _menu_cell(num: str, name: str, desc: str, danger: bool = False) -> Text:
+    t = Text(no_wrap=True, overflow="ellipsis")
+    t.append(" ")
+    t.append(f" {num} ", style=f"bold #0b0b12 on {BAD_C if danger else GOLD[3]}")
+    t.append(" ")
+    t.append(name.ljust(19), style=f"bold {BAD_C}" if danger else f"bold {CREAM}")
+    t.append(desc, style=MUTED)
+    return t
+
+
+def _render_main_menu(w: int):
+    grid = Table.grid(expand=True, padding=(0, 1))
+    grid.width = w
+    grid.add_column(ratio=1, no_wrap=True)
+    grid.add_column(ratio=1, no_wrap=True)
+    grid.add_row(_section_title("TUNNELS"), _section_title("SYSTEM"))
+    for (ln, lt, ld), (rn, rt, rd) in zip(MAIN_MENU_LEFT, MAIN_MENU_RIGHT):
+        grid.add_row(_menu_cell(ln, lt, ld), _menu_cell(rn, rt, rd, danger=(rn == "08")))
+    console.print(grid)
+
+
+def _render_tunnel_list(w: int):
+    console.print(_section_title("LIVE TUNNELS", w))
+    tunnels = list_tunnels()
+    if not tunnels:
+        console.print(Text("    No tunnels yet · press 01 to create one", style=MUTED, no_wrap=True))
+    else:
+        g = Table.grid(padding=(0, 1), expand=True)
+        g.width = w
+        g.add_column(width=3, no_wrap=True)
+        g.add_column(width=14, no_wrap=True, overflow="ellipsis")
+        g.add_column(width=24, no_wrap=True, overflow="ellipsis")
+        g.add_column(width=9, no_wrap=True)
+        g.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        for t in tunnels[:5]:
+            up = t["status"] == "active"
+            color = OK_C if up else BAD_C
+            g.add_row(
+                Text("  ●", style=color),
+                Text(str(t.get("name", "?")), style=f"bold {CREAM}"),
+                Text(f"{t.get('engine', '?')} · {t.get('transport', '?')}", style=MUTED),
+                Text("online" if up else str(t["status"]), style=color),
+                Text(str(t.get("endpoint", "")), style=MUTED),
+            )
+        console.print(g)
+        if len(tunnels) > 5:
+            console.print(Text(f"    +{len(tunnels) - 5} more · open 02 to manage", style=MUTED, no_wrap=True))
+
+    win = _last_winner()
+    line = Text(no_wrap=True, overflow="ellipsis")
+    line.append("  ★ ", style=GOLD[1])
+    line.append("best route  ", style=MUTED)
+    if win and win.get("winner"):
+        b = win["winner"]
+        mbps = float(b.get("mbps", 0) or 0)
+        rtt = float(b.get("rtt", 0) or 0)
+        line.append(f"{str(b.get('engine', '')).upper()} / {b.get('transport', '')}", style=f"bold {GOLD[1]}")
+        line.append(f"  {mbps:.0f} Mbps · {rtt:.0f} ms · grade ", style=MUTED)
+        line.append(_grade_letter(mbps, rtt), style=f"bold {GOLD[0]}")
+    else:
+        line.append("no benchmark yet · press 03", style=MUTED)
+    console.print(line)
 
 
 def main():
@@ -2824,52 +2985,38 @@ def main():
         "8": "8",
         "0": "0", "q": "0",
     }
+    actions = {
+        "1": create_tunnel_menu,
+        "2": manage_tunnels_menu,
+        "3": benchmark_menu,
+        "4": live_monitor_menu,
+        "5": watchdog_menu,
+        "6": network_toolkit_menu,
+        "7": server_core_status,
+        "8": uninstall_kerov,
+    }
 
     while True:
         render_header()
-        menu = (
-            "[bold cyan][1][/] [bold white]🚀 Create Tunnel[/]        [dim]Direct / Reverse • 6 Cores[/]\n"
-            "[bold cyan][2][/] [bold white]⚙️  Manage Tunnels[/]       [dim]Control • Logs • Sync Link[/]\n"
-            "[bold magenta][3][/] [bold white]🏆 Smart Benchmark Pro[/]  [dim]DL+UL • Grade • 1-Click Deploy[/]\n"
-            "[bold cyan][4][/] [bold white]📡 Live Monitor HUD[/]     [dim]TX/RX Sparklines • Conns[/]\n"
-            "[bold magenta][5][/] [bold white]🛡️  Watchdog & Alerts[/]    [dim]Auto-Restart • Telegram[/]\n"
-            "[bold cyan][6][/] [bold white]🔥 Network Toolkit[/]      [dim]MTU • Backup • BBR/UFW[/]\n"
-            "[bold cyan][7][/] [bold white]📊 Server & Core Status[/] [dim]All 6 Installed Cores[/]\n"
-            "[bold red][8][/] [red]🗑️  Uninstall Kerov[/]\n"
-            "[bold dim][0][/] [dim]Exit[/]"
-        )
-        left_panel = Panel(menu, title="[bold cyan]⚡ MAIN MENU[/]", border_style="cyan", box=box.ROUNDED)
-        right_panel = _build_side_status_panel()
-
-        body = Table.grid(expand=True, padding=(0, 1))
-        body.add_column(ratio=3)
-        body.add_column(ratio=2)
-        body.add_row(left_panel, right_panel)
-        console.print(body)
+        w = console.width
+        _render_main_menu(w)
+        console.print()
+        _render_tunnel_list(w)
         render_footer_bar()
 
         flush_stdin()
-        raw = Prompt.ask("[bold cyan]kerov > Select [1-8 / C,M,B,L,W,T,S,Q][/]", default="1").strip().lower()
-        choice = key_map.get(raw)
-        if choice == "1":
-            create_tunnel_menu()
-        elif choice == "2":
-            manage_tunnels_menu()
-        elif choice == "3":
-            benchmark_menu()
-        elif choice == "4":
-            live_monitor_menu()
-        elif choice == "5":
-            watchdog_menu()
-        elif choice == "6":
-            network_toolkit_menu()
-        elif choice == "7":
-            server_core_status()
-        elif choice == "8":
-            uninstall_kerov()
-        elif choice == "0":
-            console.print("\n[cyan]Goodbye.[/]\n")
+        try:
+            raw = Prompt.ask(f" [bold {GOLD[2]}]❯[/]", default="", show_default=False).strip().lower()
+        except EOFError:
             break
+        if raw.isdigit():
+            raw = str(int(raw))
+        choice = key_map.get(raw)
+        if choice == "0":
+            console.print(Text("\n  ◆ Goodbye.\n", style=GOLD[2]))
+            break
+        if choice in actions:
+            actions[choice]()
 
 
 if __name__ == "__main__":
