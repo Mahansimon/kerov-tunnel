@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kerov Tunnel v1.3 — Multi-Core Tunnel Manager & Smart Benchmark CLI
+Kerov Tunnel v2.2 — Multi-Core Tunnel Manager & Smart Benchmark CLI
 Engines:
   [Reverse] BrokenNode (12 transports incl. ip-spoofing)
             DaggerConnect v4.3.1 (13 transports)
@@ -11,6 +11,8 @@ Engines:
 """
 
 import base64
+import hmac
+import ipaddress
 from collections import deque
 from datetime import datetime
 import json
@@ -40,7 +42,6 @@ import yaml
 from rich import box
 from rich.align import Align
 from rich.console import Console
-from rich.columns import Columns
 from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
@@ -86,6 +87,50 @@ def flush_stdin():
         pass
 
 
+def _valid_ip(value: str) -> bool:
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+SAFE_SECRET_RE = re.compile(r"^[A-Za-z0-9+/=_-]{1,128}$")
+SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+
+
+def _safe_host(value: str, fallback: str) -> str:
+    value = (value or "").strip()
+    return value if SAFE_HOST_RE.match(value) else fallback
+
+
+def _validate_cfg(cfg: dict):
+    if not SAFE_NAME_RE.match(str(cfg.get("name", ""))):
+        raise ValueError("invalid tunnel name")
+    for k in ("iran_ip", "foreign_ip", "iran_tun_ip", "foreign_tun_ip", "iran_wg_ip", "foreign_wg_ip"):
+        if cfg.get(k) and not _valid_ip(str(cfg[k])):
+            raise ValueError(f"invalid {k}")
+    for k in ("tunnel_port", "wg_port", "mtu", "conn"):
+        if k in cfg:
+            v = int(cfg[k])
+            if not (1 <= v <= 65535):
+                raise ValueError(f"invalid {k}")
+            cfg[k] = v
+    for k in ("psk", "token", "key", "iran_priv", "iran_pub", "foreign_priv", "foreign_pub"):
+        if cfg.get(k) and not SAFE_SECRET_RE.match(str(cfg[k])):
+            raise ValueError(f"invalid characters in {k}")
+    for m in cfg.get("ports", []) or []:
+        for k in ("bind", "target"):
+            v = int(m[k])
+            if not (1 <= v <= 65535):
+                raise ValueError("invalid port mapping")
+            m[k] = v
+        if m.get("proto") not in ("tcp", "udp", "both"):
+            raise ValueError("invalid port protocol")
+    return cfg
+
+
 def run_cmd(cmd, check=False, capture=True):
     return subprocess.run(
         cmd,
@@ -111,7 +156,7 @@ def detect_net_info():
     if gw:
         gw_mac = run_cmd(f"ip neigh show {gw} | awk '/{iface}/ {{print $5; exit}}'").stdout.strip()
         if not gw_mac:
-            run_cmd(f"ping -c 1 -W 1 {gw}")
+            run_cmd(["ping", "-c", "1", "-W", "1", gw])
             gw_mac = run_cmd(f"ip neigh show {gw} | awk '/{iface}/ {{print $5; exit}}'").stdout.strip()
     return {
         "iface": iface,
@@ -186,11 +231,12 @@ def gen_self_signed_cert(name: str, domain: str):
     TLS_DIR.mkdir(parents=True, exist_ok=True)
     cert = TLS_DIR / f"{name}.crt"
     key = TLS_DIR / f"{name}.key"
-    run_cmd(
-        f'openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes '
-        f'-keyout "{key}" -out "{cert}" -subj "/CN={domain}" '
-        f'-addext "subjectAltName=DNS:{domain}"'
-    )
+    domain = _safe_host(domain, "localhost")
+    run_cmd([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "3650", "-nodes",
+        "-keyout", str(key), "-out", str(cert), "-subj", f"/CN={domain}",
+        "-addext", f"subjectAltName=DNS:{domain}",
+    ])
     os.chmod(key, 0o600)
     return str(cert), str(key)
 
@@ -237,8 +283,8 @@ TasksMax=infinity
 WantedBy=multi-user.target
 """
     (SYSTEMD_DIR / f"{service_name}.service").write_text(content, encoding="utf-8")
-    run_cmd("systemctl daemon-reload")
-    run_cmd(f"systemctl enable --now {service_name}")
+    run_cmd(["systemctl", "daemon-reload"])
+    run_cmd(["systemctl", "enable", "--now", service_name])
 
 
 def _mini_bar(pct: float, width: int = 10, color: str = "cyan") -> str:
@@ -899,7 +945,7 @@ def deploy_kerov_udp(cfg: dict, side: str, sync_link: str = ""):
     if side == "iran":
         wg_ip, peer_ip = cfg["iran_wg_ip"], cfg["foreign_wg_ip"]
         priv_key, peer_pub = cfg["iran_priv"], cfg["foreign_pub"]
-        u2r_cmd = f"{BINS['udp2raw']} -c -l 127.0.0.1:{wg_local_port} -r {cfg['foreign_ip']}:{u2r_port} -k {cfg['psk']} --raw-mode faketcp -a --cipher-mode xor --auth-mode simple"
+        u2r_conf_lines = ["-c", f"-l 127.0.0.1:{wg_local_port}", f"-r {cfg['foreign_ip']}:{u2r_port}"]
         wg_text = f"""[Interface]
 PrivateKey = {priv_key}
 Address = {wg_ip}/30
@@ -915,7 +961,7 @@ PersistentKeepalive = 15
     else:
         wg_ip, peer_ip = cfg["foreign_wg_ip"], cfg["iran_wg_ip"]
         priv_key, peer_pub = cfg["foreign_priv"], cfg["iran_pub"]
-        u2r_cmd = f"{BINS['udp2raw']} -s -l 0.0.0.0:{u2r_port} -r 127.0.0.1:{wg_local_port} -k {cfg['psk']} --raw-mode faketcp -a --cipher-mode xor --auth-mode simple"
+        u2r_conf_lines = ["-s", f"-l 0.0.0.0:{u2r_port}", f"-r 127.0.0.1:{wg_local_port}"]
         wg_text = f"""[Interface]
 PrivateKey = {priv_key}
 ListenPort = {wg_local_port}
@@ -930,6 +976,12 @@ AllowedIPs = {peer_ip}/32
 
     wg_conf.write_text(wg_text, encoding="utf-8")
     os.chmod(wg_conf, 0o600)
+
+    u2r_conf = out_dir / f"{name}-udp2raw.conf"
+    u2r_conf_lines += [f"-k {cfg['psk']}", "--raw-mode faketcp", "-a", "--cipher-mode aes128cbc", "--auth-mode hmac_sha1"]
+    u2r_conf.write_text("\n".join(u2r_conf_lines) + "\n", encoding="utf-8")
+    os.chmod(u2r_conf, 0o600)
+    u2r_cmd = f"{BINS['udp2raw']} --conf-file {u2r_conf}"
 
     runner = out_dir / f"{name}-run.sh"
     stopper = out_dir / f"{name}-stop.sh"
@@ -1005,6 +1057,17 @@ def create_tunnel_menu():
         if not cfg.get("foreign_ip"):
             cfg["foreign_ip"] = get_public_ip()
 
+        missing = [k for k in ("name", "engine", "direction", "transport") if k not in cfg]
+        if missing:
+            console.print(f"[bold red]✗ Sync link is missing fields:[/] {', '.join(missing)}")
+            pause()
+            return
+        try:
+            _validate_cfg(cfg)
+        except (ValueError, TypeError, KeyError) as e:
+            console.print(f"[bold red]✗ Sync link rejected:[/] {e}")
+            pause()
+            return
         eng = cfg["engine"]
         clean_link = encode_link("kerov", cfg)
         try:
@@ -1026,11 +1089,11 @@ def create_tunnel_menu():
                     pause()
                     return
                 time.sleep(1.5)
-            st = run_cmd(f"systemctl is-active {svc}").stdout.strip()
+            st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
             color = "green" if st == "active" else "red"
             console.print(f"\n[bold {color}]● Tunnel '{cfg['name']}' deployed on Foreign server — Status: {st.upper()}[/]")
             if st != "active":
-                logs = run_cmd(f"journalctl -u {svc} -n 8 --no-pager").stdout
+                logs = run_cmd(["journalctl", "-u", svc, "-n", "8", "--no-pager"]).stdout
                 console.print(Panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
         except Exception as e:
             console.print(f"\n[bold red]✗ Deployment failed:[/] {e}")
@@ -1050,10 +1113,42 @@ def create_tunnel_menu():
     if dir_choice == "0":
         return
 
-    iran_ip = Prompt.ask("Iran Server Public IP", default=get_public_ip())
+    iran_ip = ""
+    while not _valid_ip(iran_ip):
+        iran_ip = Prompt.ask("Iran Server Public IP", default=get_public_ip()).strip()
+        if not _valid_ip(iran_ip):
+            console.print("[red]Invalid IP address.[/]")
     name = Prompt.ask("Tunnel Instance Name", default=f"tun{secrets.randbelow(900)+100}").strip()
-    name = "".join(c for c in name if c.isalnum() or c in "-_") or "main"
+    name = ("".join(c for c in name if c.isascii() and (c.isalnum() or c in "-_")) or "main")[:32]
 
+    try:
+        svc, sync_link = _iran_engine_flow(dir_choice, name, iran_ip)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Cancelled.[/]")
+        pause()
+        return
+    except Exception as e:
+        console.print(f"\n[bold red]✗ Deployment failed:[/] {e}")
+        console.print(f"[dim]{traceback.format_exc()}[/]")
+        pause()
+        return
+
+    time.sleep(1.5)
+    st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
+    color = "green" if st == "active" else "red"
+    console.print(f"\n[bold {color}]● Iran Tunnel '{name}' Configured![/]  Service: [cyan]{svc}[/]  Status: [bold]{st.upper()}[/]")
+    if st != "active":
+        logs = run_cmd(["journalctl", "-u", svc, "-n", "8", "--no-pager"]).stdout
+        console.print(Panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
+    print_copyable_link(
+        "AUTO-SYNC LINK READY",
+        sync_link,
+        "Copy this exact single line and paste it on your FOREIGN server (Create Tunnel -> Option 2). (Also saved in Manage Tunnels -> Show Sync Link)"
+    )
+    pause()
+
+
+def _iran_engine_flow(dir_choice: str, name: str, iran_ip: str):
     if dir_choice == "1":
         console.print(Panel(
             "[bold cyan][1][/] [white]BrokenNode[/]       [dim]Reverse (Iran=Server | Foreign=Client) • 12 Transports[/]\n"
@@ -1082,7 +1177,11 @@ def create_tunnel_menu():
             title="[bold cyan]DIRECT TUNNEL ENGINES[/]", border_style="cyan", box=box.ROUNDED
         ))
         eng_c = Prompt.ask("Select Engine", choices=["1", "2", "3"], default="1")
-        foreign_ip = Prompt.ask("Foreign Server Public IP").strip()
+        foreign_ip = ""
+        while not _valid_ip(foreign_ip):
+            foreign_ip = Prompt.ask("Foreign Server Public IP").strip()
+            if not _valid_ip(foreign_ip):
+                console.print("[red]Invalid IP address.[/]")
         if eng_c == "1":
             cfg = wizard_paqet(name, iran_ip, foreign_ip)
             sync_link = encode_link("kerov", cfg)
@@ -1095,17 +1194,7 @@ def create_tunnel_menu():
             cfg = wizard_kerov_udp(name, iran_ip, foreign_ip)
             sync_link = encode_link("kerov", cfg)
             svc = deploy_kerov_udp(cfg, "iran", sync_link)
-
-    time.sleep(1.5)
-    st = run_cmd(f"systemctl is-active {svc}").stdout.strip()
-
-    console.print(f"\n[bold green]✔ Iran Tunnel '{name}' Configured![/]  Service: [cyan]{svc}[/]  Status: [bold]{st.upper()}[/]")
-    print_copyable_link(
-        "AUTO-SYNC LINK READY",
-        sync_link,
-        "Copy this exact single line and paste it on your FOREIGN server (Create Tunnel -> Option 2). (Also saved in Manage Tunnels -> Show Sync Link)"
-    )
-    pause()
+    return svc, sync_link
 
 
 def wizard_brokennode(name: str, iran_ip: str) -> dict:
@@ -1383,8 +1472,10 @@ def wizard_kerov_udp(name: str, iran_ip: str, foreign_ip: str) -> dict:
     ports = ask_port_mappings()
 
     def gen_wg_pair():
-        priv = run_cmd("wg genkey").stdout.strip()
-        pub = run_cmd(f"echo '{priv}' | wg pubkey").stdout.strip()
+        priv = run_cmd(["wg", "genkey"]).stdout.strip()
+        if not priv:
+            raise RuntimeError("wireguard-tools is not installed (wg genkey failed)")
+        pub = subprocess.run(["wg", "pubkey"], input=priv + "\n", capture_output=True, text=True).stdout.strip()
         return priv, pub
 
     i_priv, i_pub = gen_wg_pair()
@@ -1435,7 +1526,7 @@ def manage_tunnels_menu():
         svc = t["service"]
 
         while True:
-            st = run_cmd(f"systemctl is-active {svc}").stdout.strip()
+            st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
             st_badge = f"[bold green]{st.upper()}[/]" if st == "active" else f"[bold red]{st.upper()}[/]"
             console.print(Panel(
                 f"[bold white]{t['name']}[/]  ([magenta]{t['engine']}[/] / [cyan]{t['transport']}[/])   Status: {st_badge}\n"
@@ -1451,13 +1542,13 @@ def manage_tunnels_menu():
             elif act == "m":
                 return
             elif act == "1":
-                run_cmd(f"systemctl start {svc}")
+                run_cmd(["systemctl", "start", svc])
                 console.print("[green]✔ Started.[/]")
             elif act == "2":
-                run_cmd(f"systemctl stop {svc}")
+                run_cmd(["systemctl", "stop", svc])
                 console.print("[yellow]✔ Stopped.[/]")
             elif act == "3":
-                run_cmd(f"systemctl restart {svc}")
+                run_cmd(["systemctl", "restart", svc])
                 console.print("[cyan]✔ Restarted.[/]")
             elif act == "4":
                 console.print("[dim]Press Ctrl+C to stop following logs...[/]")
@@ -1469,7 +1560,7 @@ def manage_tunnels_menu():
                 ed = shutil.which("nano") or shutil.which("vi") or "vi"
                 subprocess.run([ed, t["config"]])
                 if Confirm.ask("Restart tunnel to apply changes?", default=True):
-                    run_cmd(f"systemctl restart {svc}")
+                    run_cmd(["systemctl", "restart", svc])
             elif act == "6":
                 slink = t.get("sync_link", "")
                 if slink:
@@ -1479,18 +1570,12 @@ def manage_tunnels_menu():
                         "Copy this single line and paste it on your FOREIGN server (Create Tunnel -> Option 2):"
                     )
                 else:
-                    console.print("[yellow]! Sync link not stored for this legacy tunnel (recreate it in v1.3 to store automatically).[/]")
+                    console.print("[yellow]! Sync link not stored for this legacy tunnel (recreate it in v2.2 to store automatically).[/]")
                 pause()
             elif act == "7":
                 if Confirm.ask(f"Permanently delete tunnel '{t['name']}'?", default=False):
-                    run_cmd(f"systemctl disable --now {svc}")
-                    (SYSTEMD_DIR / f"{svc}.service").unlink(missing_ok=True)
-                    Path(t["config"]).unlink(missing_ok=True)
-                    (META_DIR / f"{t['name']}.json").unlink(missing_ok=True)
-                    if t["engine"] == "gretap-ipsec":
-                        Path(f"/etc/ipsec.d/kerov/{t['name']}.conf").unlink(missing_ok=True)
-                        Path(f"/etc/ipsec.d/kerov/{t['name']}.secrets").unlink(missing_ok=True)
-                    run_cmd("systemctl daemon-reload")
+                    _cleanup_tunnel(t)
+                    run_cmd(["systemctl", "daemon-reload"])
                     console.print(f"[red]✔ Deleted '{t['name']}'.[/]")
                     break
 
@@ -1879,9 +1964,9 @@ def _spawn_bench_proc(
             cfg["server"] = {"addr": f"{foreign_ip}:{tport}"}
             cfg["forward"] = [{"listen": f"127.0.0.1:{fport}", "target": f"127.0.0.1:{fport}", "protocol": "tcp"}]
         else:
-            run_cmd(f"iptables -t raw -A PREROUTING -p tcp --dport {tport} -j NOTRACK 2>/dev/null || true")
-            run_cmd(f"iptables -t raw -A OUTPUT -p tcp --sport {tport} -j NOTRACK 2>/dev/null || true")
-            run_cmd(f"iptables -t mangle -A OUTPUT -p tcp --sport {tport} --tcp-flags RST RST -j DROP 2>/dev/null || true")
+            run_cmd(f"iptables -t raw -C PREROUTING -p tcp --dport {tport} -j NOTRACK 2>/dev/null || iptables -t raw -A PREROUTING -p tcp --dport {tport} -j NOTRACK 2>/dev/null || true")
+            run_cmd(f"iptables -t raw -C OUTPUT -p tcp --sport {tport} -j NOTRACK 2>/dev/null || iptables -t raw -A OUTPUT -p tcp --sport {tport} -j NOTRACK 2>/dev/null || true")
+            run_cmd(f"iptables -t mangle -C OUTPUT -p tcp --sport {tport} --tcp-flags RST RST -j DROP 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --sport {tport} --tcp-flags RST RST -j DROP 2>/dev/null || true")
         p = tmpdir / f"pq-{transport}.yaml"
         p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         return subprocess.Popen([BINS["paqet"], "run", "-c", str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -2061,7 +2146,7 @@ def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=N
         svc = deploy_kerov_udp(cfg, "iran", slink)
 
     time.sleep(1.5)
-    st = run_cmd(f"systemctl is-active {svc}").stdout.strip()
+    st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
     console.print(f"\n[bold green]✔ Winner '{name}' deployed on Iran![/]  Service: [cyan]{svc}[/]  Status: [bold]{st.upper()}[/]")
     print_copyable_link(
         "WINNER AUTO-SYNC LINK READY",
@@ -2160,6 +2245,22 @@ def benchmark_menu():
             return
         srv.close()
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        conn.settimeout(15)
+        auth = b""
+        try:
+            while not auth.endswith(b"\n") and len(auth) < 512:
+                ch = conn.recv(1)
+                if not ch:
+                    break
+                auth += ch
+        except socket.timeout:
+            pass
+        expected = hmac.new(secret.encode(), b"kerov-bench", "sha256").hexdigest()
+        if not hmac.compare_digest(auth.decode(errors="ignore").strip(), f"AUTH {expected}"):
+            console.print(f"[red]✗ Rejected unauthenticated connection from {addr[0]}.[/]")
+            conn.close()
+            pause()
+            return
         conn.settimeout(120)
         foreign_ip = addr[0]
         console.print(f"[bold green]✔ Foreign server connected from {foreign_ip}! Starting {mode_name.upper()} matrix ({len(bench_cases)} tests)...[/]\n")
@@ -2295,6 +2396,7 @@ def benchmark_menu():
         stop_ev = None
         try:
             with socket.create_connection((iran_ip, ctrl_port), timeout=15) as s:
+                s.sendall(("AUTH " + hmac.new(secret.encode(), b"kerov-bench", "sha256").hexdigest() + "\n").encode())
                 s.settimeout(120)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 console.print("[bold green]✔ Connected! Running synchronized tests (watch results on Iran)...[/]")
@@ -2412,7 +2514,7 @@ def run_watchdog_daemon():
             svc = t["service"]
             st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
             if st != "active":
-                run_cmd(f"systemctl restart {svc}")
+                run_cmd(["systemctl", "restart", svc])
                 time.sleep(2)
                 new_st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
                 send_telegram_alert(
@@ -2462,7 +2564,7 @@ def watchdog_menu():
             console.print("[green]✔ Telegram settings saved.[/]")
             pause()
         elif ch == "5":
-            ok_tg = send_telegram_alert(f"✅ <b>Kerov Tunnel v2.0</b> test alert from <code>{get_public_ip()}</code>!")
+            ok_tg = send_telegram_alert(f"✅ <b>Kerov Tunnel v2.2</b> test alert from <code>{get_public_ip()}</code>!")
             console.print("[green]✔ Test message sent![/]" if ok_tg else "[red]✗ Failed to send (check token/chat_id or network).[/]")
             pause()
 
@@ -2480,7 +2582,7 @@ def _smart_mtu_finder():
     lo, hi, best = 1100, 1472, 1200
     while lo <= hi:
         mid = (lo + hi) // 2
-        res = run_cmd(f"ping -c 1 -W 2 -M do -s {mid} {target}")
+        res = run_cmd(["ping", "-c", "1", "-W", "2", "-M", "do", "-s", str(mid), target])
         if res.returncode == 0:
             best = mid
             lo = mid + 1
@@ -2528,7 +2630,7 @@ def _backup_restore_menu():
             tf.extractall("/")
         run_cmd("systemctl daemon-reload")
         for t in list_tunnels():
-            run_cmd(f"systemctl enable --now {t['service']}")
+            run_cmd(["systemctl", "enable", "--now", t['service']])
         console.print("[bold green]✔ Backup restored and all tunnel services started![/]")
         pause()
 
@@ -2606,6 +2708,38 @@ def server_core_status():
     pause()
 
 
+def _cleanup_tunnel(t: dict):
+    svc = t.get("service", f"kerov-{t.get('name', '')}")
+    run_cmd(["systemctl", "disable", "--now", svc])
+    (SYSTEMD_DIR / f"{svc}.service").unlink(missing_ok=True)
+    name = t.get("name", "")
+    eng = t.get("engine")
+    if t.get("config"):
+        Path(t["config"]).unlink(missing_ok=True)
+    if eng == "paqet" and t.get("role") == "server":
+        try:
+            port = int(str(t.get("endpoint", "")).rsplit(":", 1)[1])
+        except (IndexError, ValueError):
+            port = None
+        if port:
+            for tbl, rule in (("raw", ["PREROUTING", "-p", "tcp", "--dport", str(port), "-j", "NOTRACK"]),
+                              ("raw", ["OUTPUT", "-p", "tcp", "--sport", str(port), "-j", "NOTRACK"]),
+                              ("mangle", ["OUTPUT", "-p", "tcp", "--sport", str(port), "--tcp-flags", "RST", "RST", "-j", "DROP"])):
+                while run_cmd(["iptables", "-t", tbl, "-D", *rule]).returncode == 0:
+                    pass
+            run_cmd("netfilter-persistent save 2>/dev/null || true")
+    elif eng == "gretap-ipsec":
+        Path(f"/etc/ipsec.d/kerov/{name}.conf").unlink(missing_ok=True)
+        Path(f"/etc/ipsec.d/kerov/{name}.secrets").unlink(missing_ok=True)
+        for s in ("up", "down"):
+            (KEROV_ETC / "gretap" / f"{name}-{s}.sh").unlink(missing_ok=True)
+        run_cmd("ipsec reload 2>/dev/null || true")
+    elif eng == "kerov-udp":
+        for s in ("run.sh", "stop.sh", "udp2raw.conf"):
+            (KEROV_ETC / "udp" / f"{name}-{s}").unlink(missing_ok=True)
+    (META_DIR / f"{name}.json").unlink(missing_ok=True)
+
+
 def uninstall_kerov():
     render_header()
     console.print(Panel(
@@ -2618,14 +2752,20 @@ def uninstall_kerov():
         return
 
     for t in list_tunnels():
-        run_cmd(f"systemctl disable --now {t['service']}")
-        (SYSTEMD_DIR / f"{t['service']}.service").unlink(missing_ok=True)
-    run_cmd("systemctl daemon-reload")
+        _cleanup_tunnel(t)
+    run_cmd(["systemctl", "daemon-reload"])
+    if Confirm.ask("Also remove bundled core binaries?", default=True):
+        for b in ("/usr/local/bin/brokennode", "/usr/local/bin/DaggerLauncher", "/usr/local/bin/backhaul_premium",
+                  "/usr/local/bin/udp2raw", "/root/backhaul-core/backhaul_premium"):
+            Path(b).unlink(missing_ok=True)
+        shutil.rmtree("/opt/paqet-plus", ignore_errors=True)
+        shutil.rmtree("/usr/local/lib/DaggerConnect-offline-v4.3.1", ignore_errors=True)
     shutil.rmtree("/etc/kerov", ignore_errors=True)
     shutil.rmtree("/opt/kerov", ignore_errors=True)
     shutil.rmtree("/etc/ipsec.d/kerov", ignore_errors=True)
     Path("/usr/local/bin/kerov").unlink(missing_ok=True)
     Path("/etc/sysctl.d/99-kerov.conf").unlink(missing_ok=True)
+    run_cmd("sysctl --system >/dev/null 2>&1")
     console.print("[bold green]✔ Kerov Tunnel completely removed.[/]")
     sys.exit(0)
 
@@ -2733,4 +2873,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        console.print("\n[dim]Bye.[/]")
+        sys.exit(130)

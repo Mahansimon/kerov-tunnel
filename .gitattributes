@@ -1,0 +1,6 @@
+* text=auto eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+cores/** binary
+*.tar.gz binary
+*.zip binary

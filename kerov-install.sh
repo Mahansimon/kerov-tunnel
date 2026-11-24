@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  Kerov Tunnel v2.0 — All-in-One Installer (6 Cores • Offline-First • Ubuntu 22+)
+#  Kerov Tunnel v2.2 — All-in-One Installer (6 Cores • Offline-First • Ubuntu 22+)
 # ==============================================================================
 set -euo pipefail
 
@@ -11,6 +11,12 @@ warn() { echo -e "${C_Y}  [!]${C_N} $*"; }
 err()  { echo -e "${C_R}  [✗]${C_N} $*" >&2; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || err "Run as root: sudo bash kerov-install.sh"
+
+if [ -r /etc/os-release ]; then
+  . /etc/os-release
+  [ "${ID:-}" = "ubuntu" ] || [ "${ID_LIKE:-}" = "debian" ] || [ "${ID:-}" = "debian" ] || warn "Untested OS: ${PRETTY_NAME:-unknown}. Ubuntu 22.04+ is recommended."
+fi
+command -v apt-get >/dev/null 2>&1 || err "apt-get not found. Ubuntu/Debian is required."
 
 SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CORES_DIR="$SRC_DIR/cores"
@@ -28,7 +34,7 @@ cat <<'EOF'
   ╦╔═╔═╗╦═╗╔═╗╦  ╦  ╔╦╗╦ ╦╔╗╔╔╗╔╔═╗╦
   ╠╩╗║╣ ╠╦╝║ ║╚╗╔╝   ║ ║ ║║║║║║║║╣ ║
   ╩ ╩╚═╝╩╚═╚═╝ ╚╝    ╩ ╚═╝╝╚╝╝╚╝╚═╝╩═╝
-      All-in-One Installer v2.0
+      All-in-One Installer v2.2
 EOF
 echo -e "${C_N}"
 
@@ -164,6 +170,6 @@ sysctl --system >/dev/null 2>&1 || true
 # 7) Install Kerov CLI
 install -m 0755 "$SRC_DIR/kerov.py" "$KEROV_DIR/kerov.py"
 ln -sf "$KEROV_DIR/kerov.py" /usr/local/bin/kerov
-ok "Kerov Tunnel v2.0 installed! Launch anytime with: sudo kerov"
+ok "Kerov Tunnel v2.2 installed! Launch anytime with: sudo kerov"
 echo ""
-exec /usr/local/bin/kerov
+if [ -t 0 ]; then exec /usr/local/bin/kerov; fi
