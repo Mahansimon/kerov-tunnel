@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  Kerov Tunnel v2.2 — All-in-One Installer (6 Cores • Offline-First • Ubuntu 22+)
+#  Kerov Tunnel v2.2.2 — All-in-One Installer (6 Cores • Offline-First • Ubuntu 22+)
 # ==============================================================================
 set -euo pipefail
 
@@ -16,12 +16,29 @@ if [ -r /etc/os-release ]; then
   . /etc/os-release
   [ "${ID:-}" = "ubuntu" ] || [ "${ID_LIKE:-}" = "debian" ] || [ "${ID:-}" = "debian" ] || warn "Untested OS: ${PRETTY_NAME:-unknown}. Ubuntu 22.04+ is recommended."
 fi
-command -v apt-get >/dev/null 2>&1 || err "apt-get not found. Ubuntu/Debian is required."
-
 SRC_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CORES_DIR="$SRC_DIR/cores"
 KEROV_DIR="/opt/kerov"
 KEROV_ETC="/etc/kerov"
+
+install_cli() {
+  install -d "$KEROV_DIR"
+  install -m 0755 "$SRC_DIR/kerov.py" "$KEROV_DIR/kerov.py"
+  ln -sf "$KEROV_DIR/kerov.py" /usr/local/bin/kerov
+  ok "Kerov Tunnel v2.2.2 installed! Launch anytime with: sudo kerov"
+}
+
+if [ "${1:-}" = "--cli-only" ]; then
+  for dependency in python3 ip systemctl flock; do
+    command -v "$dependency" >/dev/null 2>&1 || err "Required command not found: $dependency"
+  done
+  PYTHONPATH="$KEROV_DIR" python3 -c 'import rich, yaml, psutil' 2>/dev/null ||
+    err "Install the Kerov Python dependencies (rich, PyYAML and psutil) before using --cli-only. See README.md."
+  install_cli
+  exit 0
+fi
+[ "$#" -eq 0 ] || err "Usage: sudo bash kerov-install.sh [--cli-only]"
+command -v apt-get >/dev/null 2>&1 || err "apt-get not found. Ubuntu/Debian is required."
 
 case "$(uname -m)" in
   x86_64|amd64) ARCH="amd64" ;;
@@ -34,7 +51,7 @@ cat <<'EOF'
   ╦╔═╔═╗╦═╗╔═╗╦  ╦  ╔╦╗╦ ╦╔╗╔╔╗╔╔═╗╦
   ╠╩╗║╣ ╠╦╝║ ║╚╗╔╝   ║ ║ ║║║║║║║║╣ ║
   ╩ ╩╚═╝╩╚═╚═╝ ╚╝    ╩ ╚═╝╝╚╝╝╚╝╚═╝╩═╝
-      All-in-One Installer v2.2
+      All-in-One Installer v2.2.2
 EOF
 echo -e "${C_N}"
 
@@ -168,8 +185,6 @@ EOF
 sysctl --system >/dev/null 2>&1 || true
 
 # 7) Install Kerov CLI
-install -m 0755 "$SRC_DIR/kerov.py" "$KEROV_DIR/kerov.py"
-ln -sf "$KEROV_DIR/kerov.py" /usr/local/bin/kerov
-ok "Kerov Tunnel v2.2 installed! Launch anytime with: sudo kerov"
+install_cli
 echo ""
 if [ -t 0 ]; then exec /usr/local/bin/kerov; fi

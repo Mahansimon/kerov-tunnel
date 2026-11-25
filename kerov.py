@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kerov Tunnel v2.2 — Multi-Core Tunnel Manager & Smart Benchmark CLI
+Kerov Tunnel v2.2.2 — Multi-Core Tunnel Manager & Smart Benchmark CLI
 Engines:
   [Reverse] BrokenNode (12 transports incl. ip-spoofing)
             DaggerConnect v4.3.1 (13 transports)
@@ -11,6 +11,8 @@ Engines:
 """
 
 import base64
+import fcntl
+import hashlib
 import hmac
 import ipaddress
 from collections import deque
@@ -97,6 +99,11 @@ def _valid_ip(value: str) -> bool:
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 SAFE_SECRET_RE = re.compile(r"^[A-Za-z0-9+/=_-]{1,128}$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
+MANUAL_ENGINE = "manual-ip"
+PRIVATE_V4_NETWORKS = tuple(
+    ipaddress.IPv4Network(network)
+    for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 
 
 def _safe_host(value: str, fallback: str) -> str:
@@ -105,7 +112,8 @@ def _safe_host(value: str, fallback: str) -> str:
 
 
 def _validate_cfg(cfg: dict):
-    if not SAFE_NAME_RE.match(str(cfg.get("name", ""))):
+    name = cfg.get("name")
+    if not isinstance(name, str) or not SAFE_NAME_RE.fullmatch(name):
         raise ValueError("invalid tunnel name")
     for k in ("iran_ip", "foreign_ip", "iran_tun_ip", "foreign_tun_ip", "iran_wg_ip", "foreign_wg_ip"):
         if cfg.get(k) and not _valid_ip(str(cfg[k])):
@@ -260,7 +268,19 @@ def save_meta(meta: dict):
     (META_DIR / f"{meta['name']}.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
 
-def write_systemd(service_name: str, desc: str, exec_start: str, exec_stop: str = "", env_lines=None, oneshot=False):
+def _protect_manual_name(name: str):
+    existing = META_DIR / f"{name}.json"
+    if existing.is_file() and json.loads(existing.read_text(encoding="utf-8")).get("engine") == MANUAL_ENGINE:
+        raise ValueError(f"Name '{name}' is already used by a Manual Tunnel. Choose another name.")
+
+
+def _instance_status(engine: str, status: str, active_label: str = "ACTIVE") -> str:
+    if status == "active":
+        return "IP CONFIGURED" if engine == MANUAL_ENGINE else active_label
+    return status.upper()
+
+
+def write_systemd(service_name: str, desc: str, exec_start: str, exec_stop: str = "", env_lines=None, oneshot=False, check=False):
     env_block = "\n".join(f"Environment={e}" for e in (env_lines or []))
     svc_type = "oneshot\nRemainAfterExit=yes" if oneshot else "simple\nRestart=always\nRestartSec=2"
     stop_line = f"ExecStop={exec_stop}" if exec_stop else ""
@@ -282,8 +302,8 @@ TasksMax=infinity
 WantedBy=multi-user.target
 """
     (SYSTEMD_DIR / f"{service_name}.service").write_text(content, encoding="utf-8")
-    run_cmd(["systemctl", "daemon-reload"])
-    run_cmd(["systemctl", "enable", "--now", service_name])
+    run_cmd(["systemctl", "daemon-reload"], check=check)
+    run_cmd(["systemctl", "enable", "--now", service_name], check=check)
 
 
 def _mini_bar(pct: float, width: int = 10, color: str = "cyan") -> str:
@@ -338,7 +358,7 @@ def _sample_net_mbps(interval: float = 0.25):
 
 
 UI_MAX_W = 80
-KEROV_VERSION = "v2.2"
+KEROV_VERSION = "v2.2.2"
 GOLD = ("#fff1b8", "#ffe08a", "#f5c542", "#e6b422", "#d4a017", "#a8790f")
 G_DIM = "#6b5a2e"
 CREAM = "#f3e9d2"
@@ -515,7 +535,7 @@ def pause():
 #  PORT MAPPING HELPER
 # ==============================================================================
 
-def ask_port_mappings():
+def ask_port_mappings(*, default_443=True):
     console.print("[bold cyan]Port Mappings[/] [dim](format: 443 or 8443=443; leave empty when done)[/]")
     ports = []
     while True:
@@ -535,7 +555,7 @@ def ask_port_mappings():
             console.print(f"  [green]✔ Added {b_int} -> {t_int} ({proto})[/]")
         except ValueError:
             console.print("  [red]✗ Invalid port number. Use 1-65535.[/]")
-    if not ports:
+    if not ports and default_443:
         ports.append({"bind": 443, "target": 443, "proto": "both"})
         console.print("  [yellow]! Defaulted to 443 -> 443 (both)[/]")
     return ports
@@ -952,6 +972,81 @@ def deploy_paqet(cfg: dict, side: str, sync_link: str = ""):
     return svc
 
 
+def _manual_ipv4(value: str) -> str:
+    address = ipaddress.IPv4Address(value)
+    if not any(address in network for network in PRIVATE_V4_NETWORKS):
+        raise ValueError("Use a private IPv4 address from 10/8, 172.16/12 or 192.168/16.")
+    return str(address)
+
+
+def deploy_manual_ip(cfg: dict, side: str):
+    name = cfg["name"]
+    if not isinstance(name, str) or not SAFE_NAME_RE.fullmatch(name):
+        raise ValueError("Invalid instance name.")
+    iran_ip = _manual_ipv4(cfg["iran_tun_ip"])
+    foreign_ip = _manual_ipv4(cfg["foreign_tun_ip"])
+    if iran_ip == foreign_ip:
+        raise ValueError("The two private IP addresses must differ.")
+    local_ip, peer_ip = (iran_ip, foreign_ip) if side == "iran" else (foreign_ip, iran_ip)
+    ifname = "krp" + hashlib.sha256(name.encode("ascii")).hexdigest()[:12]
+    service = f"kerov-ip-{name}"
+    directory = KEROV_ETC / "manual"
+    directory.mkdir(parents=True, exist_ok=True)
+    script = directory / f"{name}.sh"
+    unit = SYSTEMD_DIR / f"{service}.service"
+    metadata = META_DIR / f"{name}.json"
+    link = encode_link("kerov", {
+        "name": name, "engine": MANUAL_ENGINE, "direction": "manual", "transport": "ipv4",
+        "iran_tun_ip": iran_ip, "foreign_tun_ip": foreign_ip,
+    })
+    with (directory / ".deploy.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if any(path.exists() for path in (metadata, script, unit)):
+            raise ValueError(f"Name '{name}' is already in use. Choose another name on both servers.")
+
+        script.write_text(f"""#!/bin/sh
+set -eu
+if [ "$1" = stop ]; then
+    if ip link show dev {ifname} >/dev/null 2>&1; then
+        ip link del dev {ifname}
+    fi
+    exit 0
+fi
+exec 9>/run/kerov-manual-ip.lock
+flock -x 9
+existing=$(ip -o -4 addr show to {local_ip}/32)
+if [ -n "$existing" ]; then
+    echo 'Private IP {local_ip} is already assigned on this server.' >&2
+    exit 1
+fi
+ip link add name {ifname} type dummy
+trap 'ip link del dev {ifname}' EXIT
+ip -4 addr add {local_ip}/32 dev {ifname} noprefixroute
+ip link set dev {ifname} up
+trap - EXIT
+""", encoding="utf-8")
+        try:
+            script.chmod(0o700)
+            write_systemd(service, f"Manual IP ({name})", f"{script} start",
+                          exec_stop=f"{script} stop", oneshot=True, check=True)
+            save_meta({
+                "name": name, "engine": MANUAL_ENGINE, "direction": "manual",
+                "transport": "ipv4", "role": side, "service": service,
+                "config": str(script), "endpoint": f"{local_ip}/32 (peer: {peer_ip})",
+                "sync_link": link,
+            })
+        except Exception as error:
+            run_cmd(["systemctl", "disable", "--now", service])
+            unit.unlink(missing_ok=True)
+            script.unlink(missing_ok=True)
+            metadata.unlink(missing_ok=True)
+            run_cmd(["systemctl", "daemon-reload"])
+            if isinstance(error, subprocess.CalledProcessError):
+                raise RuntimeError(f"Could not configure {local_ip}/32. See: journalctl -u {service}") from error
+            raise
+    return service, link
+
+
 def deploy_gretap_ipsec(cfg: dict, side: str, sync_link: str = ""):
     """Direct Layer-2 Tunnel: StrongSwan IKEv2 (Transport) + GRETAP (L2)"""
     name = cfg["name"]
@@ -996,8 +1091,9 @@ def deploy_gretap_ipsec(cfg: dict, side: str, sync_link: str = ""):
     up_script.parent.mkdir(parents=True, exist_ok=True)
 
     nat_up, nat_down = [], []
-    if side == "iran":
-        for p in cfg.get("ports", []):
+    ports = cfg.get("ports") or []
+    if side == "iran" and ports:
+        for p in ports:
             for pr in (["tcp", "udp"] if p["proto"] == "both" else [p["proto"]]):
                 nat_up.append(f"iptables -t nat -C PREROUTING -p {pr} --dport {p['bind']} -j DNAT --to-destination {remote_tun}:{p['target']} 2>/dev/null || iptables -t nat -A PREROUTING -p {pr} --dport {p['bind']} -j DNAT --to-destination {remote_tun}:{p['target']}")
                 nat_down.append(f"iptables -t nat -D PREROUTING -p {pr} --dport {p['bind']} -j DNAT --to-destination {remote_tun}:{p['target']} 2>/dev/null || true")
@@ -1148,19 +1244,13 @@ def create_tunnel_menu():
             return
         try:
             cfg = decode_link(link, "kerov")
+            if not isinstance(cfg, dict):
+                raise ValueError("Expected a configuration object.")
         except Exception as e:
             console.print(f"\n[bold red]✗ Invalid sync link:[/] {e}")
             console.print("[dim]Make sure you copied the complete kerov://... string without missing characters.[/]")
             pause()
             return
-
-        console.print(Panel(
-            f"[cyan]Name:[/] {cfg['name']}   [cyan]Engine:[/] {cfg['engine']}   [cyan]Direction:[/] {cfg['direction'].upper()}\n"
-            f"[cyan]Transport:[/] {cfg['transport']}   [cyan]Iran IP:[/] {cfg.get('iran_ip', '-')}",
-            title="[bold green]DECODED SYNC PAYLOAD[/]", border_style="green", box=box.ROUNDED
-        ))
-        if not cfg.get("foreign_ip"):
-            cfg["foreign_ip"] = get_public_ip()
 
         missing = [k for k in ("name", "engine", "direction", "transport") if k not in cfg]
         if missing:
@@ -1169,11 +1259,21 @@ def create_tunnel_menu():
             return
         try:
             _validate_cfg(cfg)
+            _protect_manual_name(cfg["name"])
+            if any(not isinstance(cfg[k], str) for k in ("engine", "direction", "transport")):
+                raise ValueError("Engine, direction and transport must be strings.")
         except (ValueError, TypeError, KeyError) as e:
             console.print(f"[bold red]✗ Sync link rejected:[/] {e}")
             pause()
             return
         eng = cfg["engine"]
+        if eng != MANUAL_ENGINE and not cfg.get("foreign_ip"):
+            cfg["foreign_ip"] = get_public_ip()
+        console.print(Panel(
+            f"[cyan]Name:[/] {cfg['name']}   [cyan]Engine:[/] {eng}   [cyan]Direction:[/] {cfg['direction'].upper()}\n"
+            f"[cyan]Transport:[/] {cfg['transport']}   [cyan]Iran IP:[/] {cfg.get('iran_ip') or cfg.get('iran_tun_ip', '-')}",
+            title="[bold green]DECODED SYNC PAYLOAD[/]", border_style="green", box=box.ROUNDED
+        ))
         clean_link = encode_link("kerov", cfg)
         try:
             with console.status("[bold cyan]Auto-configuring Foreign server & starting service...[/]"):
@@ -1189,6 +1289,8 @@ def create_tunnel_menu():
                     svc = deploy_gretap_ipsec(cfg, "foreign", clean_link)
                 elif eng == "kerov-udp":
                     svc = deploy_kerov_udp(cfg, "foreign", clean_link)
+                elif eng == MANUAL_ENGINE:
+                    svc, _ = deploy_manual_ip(cfg, "foreign")
                 else:
                     console.print(f"[red]Unknown engine: {eng}[/]")
                     pause()
@@ -1196,7 +1298,8 @@ def create_tunnel_menu():
                 time.sleep(1.5)
             st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
             color = "green" if st == "active" else "red"
-            console.print(f"\n[bold {color}]● Tunnel '{cfg['name']}' deployed on Foreign server — Status: {st.upper()}[/]")
+            label = _instance_status(eng, st)
+            console.print(f"\n[bold {color}]● Tunnel '{cfg['name']}' deployed on Foreign server — Status: {label}[/]")
             if st != "active":
                 logs = run_cmd(["journalctl", "-u", svc, "-n", "8", "--no-pager"]).stdout
                 console.print(Panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
@@ -1211,15 +1314,17 @@ def create_tunnel_menu():
         "    [dim]• BrokenNode (12 Transports)   • DaggerConnect (13 Transports)   • Backhaul Premium (10 Transports)[/]\n\n"
         "[bold cyan][2] DIRECT Tunnels[/]   [green](Iran = Client  |  Foreign = Server)[/]\n"
         "    [dim]• paqet-plus (Raw TCP+KCP)     • GRE over IPsec L2 (gretap)      • Kerov-UDP (FakeTCP+WG)[/]\n\n"
+        "[bold yellow][3] Manual Tunnel (Private IP Only)[/]\n"
+        "    [dim]Assign a private IPv4 on each server. Bring your own tunnel and routes.[/]\n\n"
         "[dim][0] Back[/]",
         title="[bold cyan]STEP 1: SELECT TUNNEL DIRECTION[/]", border_style="cyan", box=box.ROUNDED
     ))
-    dir_choice = Prompt.ask("[bold cyan]kerov > Direction[/]", choices=["0", "1", "2"], default="1")
+    dir_choice = Prompt.ask("[bold cyan]kerov > Direction[/]", choices=["0", "1", "2", "3"], default="1")
     if dir_choice == "0":
         return
 
     iran_ip = ""
-    while not _valid_ip(iran_ip):
+    while dir_choice != "3" and not _valid_ip(iran_ip):
         iran_ip = Prompt.ask("Iran Server Public IP", default=get_public_ip()).strip()
         if not _valid_ip(iran_ip):
             console.print("[red]Invalid IP address.[/]")
@@ -1227,7 +1332,11 @@ def create_tunnel_menu():
     name = ("".join(c for c in name if c.isascii() and (c.isalnum() or c in "-_")) or "main")[:32]
 
     try:
-        svc, sync_link = _iran_engine_flow(dir_choice, name, iran_ip)
+        if dir_choice == "3":
+            svc, sync_link = deploy_manual_ip(wizard_manual_ip(name), "iran")
+        else:
+            _protect_manual_name(name)
+            svc, sync_link = _iran_engine_flow(dir_choice, name, iran_ip)
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled.[/]")
         pause()
@@ -1241,7 +1350,8 @@ def create_tunnel_menu():
     time.sleep(1.5)
     st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
     color = "green" if st == "active" else "red"
-    console.print(f"\n[bold {color}]● Iran Tunnel '{name}' Configured![/]  Service: [cyan]{svc}[/]  Status: [bold]{st.upper()}[/]")
+    label = _instance_status(MANUAL_ENGINE if dir_choice == "3" else "", st)
+    console.print(f"\n[bold {color}]● Iran Tunnel '{name}' Configured![/]  Service: [cyan]{svc}[/]  Status: [bold]{label}[/]")
     if st != "active":
         logs = run_cmd(["journalctl", "-u", svc, "-n", "8", "--no-pager"]).stdout
         console.print(Panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
@@ -1554,13 +1664,30 @@ def wizard_paqet(name: str, iran_ip: str, foreign_ip: str) -> dict:
     }
 
 
+def wizard_manual_ip(name: str) -> dict:
+    subnet = secrets.randbelow(200) + 20
+    while True:
+        iran = Prompt.ask("Iran private IPv4", default=f"10.200.{subnet}.1").strip()
+        foreign = Prompt.ask("Foreign private IPv4", default=f"10.200.{subnet}.2").strip()
+        try:
+            iran, foreign = _manual_ipv4(iran), _manual_ipv4(foreign)
+            if iran == foreign:
+                raise ValueError("The two private IP addresses must differ.")
+        except ValueError as error:
+            console.print(f"[red]{error}[/]")
+            continue
+        return {"name": name, "iran_tun_ip": iran, "foreign_tun_ip": foreign}
+
+
 def wizard_gretap(name: str, iran_ip: str, foreign_ip: str) -> dict:
     console.print("[bold cyan]GRE over IPsec Layer 2 (StrongSwan IKEv2 + GRETAP) [Direct: Iran=Client | Foreign=Server][/]")
     subnet_octet = secrets.randbelow(200) + 20
     iran_tun = Prompt.ask("Iran L2 Tunnel IP", default=f"10.200.{subnet_octet}.1")
     foreign_tun = Prompt.ask("Foreign L2 Tunnel IP", default=f"10.200.{subnet_octet}.2")
     mtu = IntPrompt.ask("GRETAP MTU", default=1380)
-    ports = ask_port_mappings()
+    ports = []
+    if Confirm.ask("Enable port forwarding on the Iran server?", default=False):
+        ports = ask_port_mappings(default_443=False)
     return {
         "name": name, "engine": "gretap-ipsec", "direction": "direct",
         "transport": "gretap-l2/ikev2", "iran_ip": iran_ip, "foreign_ip": foreign_ip,
@@ -1614,7 +1741,8 @@ def manage_tunnels_menu():
         tbl.add_column("Transport", style="cyan")
         tbl.add_column("Status", style="bold")
         for idx, t in enumerate(tunnels, 1):
-            st_str = "[bold green]● ACTIVE[/]" if t["status"] == "active" else f"[bold red]○ {t['status'].upper()}[/]"
+            label = _instance_status(t["engine"], t["status"])
+            st_str = f"[bold green]● {label}[/]" if t["status"] == "active" else f"[bold red]○ {label}[/]"
             tbl.add_row(str(idx), t["name"], t["engine"], f"{t['direction']} ({t['role']})", t["transport"], st_str)
         console.print(tbl)
         if not tunnels:
@@ -1632,9 +1760,12 @@ def manage_tunnels_menu():
 
         while True:
             st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
-            st_badge = f"[bold green]{st.upper()}[/]" if st == "active" else f"[bold red]{st.upper()}[/]"
+            label = _instance_status(t["engine"], st)
+            st_badge = f"[bold green]{label}[/]" if st == "active" else f"[bold red]{label}[/]"
+            endpoint = f"[dim]{t['endpoint']}[/]\n" if t["engine"] == MANUAL_ENGINE else ""
             console.print(Panel(
                 f"[bold white]{t['name']}[/]  ([magenta]{t['engine']}[/] / [cyan]{t['transport']}[/])   Status: {st_badge}\n"
+                f"{endpoint}"
                 f"[dim]Service: {svc}   Config: {t['config']}[/]\n\n"
                 "[green][1] Start[/]   [yellow][2] Stop[/]   [cyan][3] Restart[/]\n"
                 "[white][4] Live Logs[/]   [white][5] Edit Config[/]   [bold cyan][6] Show Sync Link (kerov://)[/]\n"
@@ -2168,6 +2299,7 @@ def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=N
     ))
     name = Prompt.ask("Tunnel Instance Name", default=f"win-{eng[:2]}{secrets.randbelow(90)+10}").strip()
     name = "".join(c for c in name if c.isalnum() or c in "-_") or "winner"
+    _protect_manual_name(name)
     ports = ask_port_mappings()
 
     if eng == "brokennode":
@@ -2590,7 +2722,8 @@ def live_monitor_menu():
         tbl.add_column("Endpoint", style="dim")
         tbl.add_column("Health", style="bold")
         for t in tunnels:
-            badge = "[bold green]● ONLINE[/]" if t["status"] == "active" else f"[bold red]○ {t['status'].upper()}[/]"
+            label = _instance_status(t["engine"], t["status"], "ONLINE")
+            badge = f"[bold green]● {label}[/]" if t["status"] == "active" else f"[bold red]○ {label}[/]"
             tbl.add_row(t["name"], t["engine"], t["transport"], t.get("endpoint", "-"), badge)
         if not tunnels:
             tbl.add_row("[dim]No tunnels[/]", "-", "-", "-", "[dim]-[/]")
@@ -2620,6 +2753,8 @@ def run_watchdog_daemon():
         cfg = _load_watchdog_cfg()
         interval = max(10, int(cfg.get("interval", 30)))
         for t in list_tunnels():
+            if t["engine"] == MANUAL_ENGINE:
+                continue
             svc = t["service"]
             st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
             if st != "active":
@@ -2819,7 +2954,9 @@ def server_core_status():
 
 def _cleanup_tunnel(t: dict):
     svc = t.get("service", f"kerov-{t.get('name', '')}")
-    run_cmd(["systemctl", "disable", "--now", svc])
+    stopped = run_cmd(["systemctl", "disable", "--now", svc])
+    if t.get("engine") == MANUAL_ENGINE and stopped.returncode != 0:
+        raise RuntimeError(f"Could not disable {svc}: {stopped.stderr.strip()}")
     (SYSTEMD_DIR / f"{svc}.service").unlink(missing_ok=True)
     name = t.get("name", "")
     eng = t.get("engine")
@@ -2938,7 +3075,7 @@ def _render_tunnel_list(w: int):
         g.add_column(width=3, no_wrap=True)
         g.add_column(width=14, no_wrap=True, overflow="ellipsis")
         g.add_column(width=24, no_wrap=True, overflow="ellipsis")
-        g.add_column(width=9, no_wrap=True)
+        g.add_column(width=13, no_wrap=True)
         g.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
         for t in tunnels[:5]:
             up = t["status"] == "active"
@@ -2947,7 +3084,7 @@ def _render_tunnel_list(w: int):
                 Text("  ●", style=color),
                 Text(str(t.get("name", "?")), style=f"bold {CREAM}"),
                 Text(f"{t.get('engine', '?')} · {t.get('transport', '?')}", style=MUTED),
-                Text("online" if up else str(t["status"]), style=color),
+                Text(_instance_status(t["engine"], t["status"], "ONLINE").lower(), style=color),
                 Text(str(t.get("endpoint", "")), style=MUTED),
             )
         console.print(g)
