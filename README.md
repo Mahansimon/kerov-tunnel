@@ -1,4 +1,4 @@
-# Kerov Tunnel v2.3.4
+# Kerov Tunnel v2.3.10
 
 Multi-core tunnel manager & smart benchmark CLI for Ubuntu 22.04+ (amd64 / arm64).
 
@@ -20,19 +20,19 @@ Multi-core tunnel manager & smart benchmark CLI for Ubuntu 22.04+ (amd64 / arm64
 ## Install this ZIP
 
 Copy the ZIP to both servers and extract it. For an existing Kerov installation,
-update the CLI and install the bundled LeechTunnel and QS-Tunnel cores without
-downloading packages or restarting existing tunnels:
+update the CLI and install the bundled cores without downloading packages or
+restarting existing tunnels.
 
 ```bash
-unzip Kerov-Tunnel-v2.3.4.zip -d kerov-v2.3.4
-cd kerov-v2.3.4/kerov-tunnel
-sudo bash kerov-install.sh --cli-only
+unzip Kerov-Tunnel-v2.3.10.zip -d kerov-v2.3.10
+cd kerov-v2.3.10/kerov-tunnel
+sudo bash kerov-install.sh --offline
 sudo kerov
 ```
 
 For a fresh full installation on an Ubuntu server with access to its package
 repositories, run `sudo bash kerov-install.sh` in the extracted directory.
-For a fresh offline CLI install, `--cli-only` needs `python3`, `iproute2`, systemd,
+For a fresh offline CLI install, `--offline` needs `python3`, `iproute2`, systemd,
 and the Python packages `rich`, `PyYAML`, and `psutil`.
 These are normally present if Kerov already runs. If the Python packages are missing,
 prepare wheels on an internet-connected machine with the same Linux architecture
@@ -45,8 +45,14 @@ python3 -m pip download --only-binary=:all: -d kerov-wheels rich PyYAML psutil
 # On the offline server, with pip installed
 sudo python3 -m pip install --no-index --find-links ./kerov-wheels \
   --target /opt/kerov rich PyYAML psutil
-sudo bash kerov-install.sh --cli-only
+sudo bash kerov-install.sh --offline
 ```
+
+The offline option skips OS package installation and network downloads. It
+installs C-Tunnel and the bundled LeechTunnel and QS-Tunnel binaries for their
+supported architectures. A new offline ICMP installation needs the local binary
+passed with `--icmp-core`. Older engines that have not already been installed
+may need the full Kerov installer and distribution packages.
 
 ## LeechTunnel, QS-Tunnel and ICMP Tunnel
 
@@ -124,12 +130,20 @@ curl --socks5-hostname 127.0.0.1:1080 https://example.org/
 
 ### ICMP Tunnel
 
-Use a Linux amd64 core that you are authorized to run under the Q-TEAM license.
-Install it on both servers before selecting **Direct → ICMP Tunnel**:
+On Linux amd64, Kerov automatically installs the ICMP core. It reuses an
+existing installed core or imports the upstream executable from
+`/usr/local/bin/ICMPTunnel`. Otherwise it downloads Q-TEAM's pinned v1.1.0
+release directly and verifies its SHA-256 before installing it. Use the core
+under the Q-TEAM license. The binary is distributed by Q-TEAM.
+
+If GitHub is unreachable, use your authorized local binary on each server:
 
 ```bash
-sudo install -D -m 0755 ./ICMPTunnel-linux-amd64 /usr/local/lib/kerov/cores/ICMPTunnel
+sudo bash kerov-install.sh --cli-only --icmp-core /path/to/ICMPTunnel-linux-amd64
 ```
+
+For a fresh install, omit `--cli-only`. Stop the standalone upstream ICMP service
+before running the Kerov ICMP tunnel or its temporary benchmark.
 
 Before configuring either side, verify IPv4 ICMP reachability. The upstream
 installer sets `net.ipv4.icmp_echo_ignore_all=1` on each host. Kerov checks that
@@ -146,6 +160,88 @@ firewall rules. QS and ICMP use `iptables` and `ip6tables` where their services
 install inbound rules. Recreate the instance if changing its guarded ports,
 so the systemd rules and the configuration stay in sync.
 Test traffic through the Iran SOCKS5 endpoint, port 1010 by default.
+
+## C-Tunnel
+
+`cores/ctunnel/` contains the unmodified official C-Tunnel v2.1.0 CLI and engine
+binaries for Linux amd64, arm64 and armv7, the kernel helper, the systemd files,
+the upstream installer, and the corresponding source archive. Kerov verifies
+the official SHA-256 manifest and the assets it installs. On a server with
+systemd, install only the C-Tunnel core directly from the ZIP by running
+`sudo bash kerov-install.sh --ctunnel-core-only` from the extracted project
+directory. This option also works without Kerov's Python dependencies. Install
+`iproute2` and `iptables` for native methods and forwarding that require them.
+
+The native panel and watchdog files are included for standalone use. Kerov's
+installer leaves those standalone services inactive and uses its own management
+menu. ARMv7 support here is for C-Tunnel and does not extend to every Kerov core.
+
+Based on C-Tunnel by CIAUB  
+https://github.com/CIAUB/C-Tunnel
+
+[Official release](https://github.com/CIAUB/C-Tunnel/releases/tag/v2.1.0) ·
+[Corresponding upstream source](https://github.com/CIAUB/C-Tunnel/tree/v2.1.0)
+
+On Iran choose **Create Tunnel → Iran Server → Direct or Reverse → C-Tunnel**.
+Apply the generated Kerov sync link on the Foreign server. Direct offers 28
+active methods and Reverse offers 25. The Direct-only methods are `ip6gre`,
+`eoip`, and `vxlan`. The official v2.1.0 catalog retired legacy methods for
+new creation. `ip6gre` needs IPv6 underlay addresses on both servers.
+
+The C-Tunnel wizard exposes native transport ports, forwarding, MTU, profiles,
+ECMP lanes, TLS / WebSocket host, padding, EoIP ID, VXLAN VNI, traffic limits
+and backup transport where applicable. Manage Tunnels uses native service
+controls for C-Tunnel. The C-Tunnel agent handles automatic profiles, quotas and
+failover. Port mappings are served by the Iran endpoint in both directions.
+
+**Smart Benchmark → Iran Server → C-Tunnel Native** runs the native catalog
+on an existing two-server benchmark session. Full Mode appends the native
+suite after the 94 Kerov cases, and Custom Cores accepts `ctunnel`. The
+native suite displays its own report and skips methods that lack the required
+path or host support. The upstream automatic suite does not test the IPv6
+underlay of `ip6gre`. Use **Benchmark Managed Tunnel** after creating the
+IPv6 tunnel to measure traffic through it.
+
+## Terminal appearance
+
+Kerov uses a warm red, amber and cream palette for its menus, prompts and
+benchmark. Menu choices are left-aligned in one column. The main menu displays
+a large KerovTunnel wordmark when there is room. Adjust font size in your local
+terminal or SSH client.
+
+## Smart Benchmark display
+
+The terminal board shows the current case and recent results while the test
+runs. **Echo** counts successful replies out of five. **OK** means all echoes
+and both transfers succeeded. **Unstable** flags missing echoes or an incomplete
+transfer. **Estimate** identifies the preset Kerov-UDP row in the matrix.
+The results table includes direction, download, upload, RTT, jitter, loss and
+grade, with a stacked layout for narrower terminals.
+
+## Benchmark before creating a tunnel
+
+Update both servers to v2.3.10. Use **Smart Benchmark → Iran Server → Full Mode**
+for the 94-case matrix, or select `leech,qs,icmp` under **Custom Cores** to test
+just those three engines. On Foreign, use **Peer Agent** with the generated
+`kerov-test://` link.
+
+The 45 earlier cases remain in the matrix. Leech adds 44 cases across Direct and
+Reverse, including its TUN encapsulations and IPX profiles. QS adds four cases
+and ICMP adds one. Kerov creates temporary endpoints for these engines, runs
+echo and throughput probes through each one, and stops the endpoints after each
+case. Temporary endpoints do not appear in Manage Tunnels.
+
+QS needs a working upload SOCKS5 proxy and its egress IPv4. QS spoof variants use
+an IPv4 assigned on Foreign. ICMP needs the separate core on both hosts and the
+sysctl described above. Use **Benchmark Managed Tunnel** for an already
+configured ICMP instance. Leech tests use its configured license, selected
+carrier and the host capabilities that carrier requires. Setup errors appear
+below the results table. The test uses the coordinator TCP port and scoped
+temporary transport ports in the 49200–50799 range as needed by each case.
+The benchmark does not change provider firewall rules. The peer has up to five
+minutes to connect. Each transfer has a 100-second budget and tolerates up to
+25 seconds of inactivity. A failed case is scored and the matrix continues
+while the control connection stays up.
 
 ## Benchmark a running Leech, QS or ICMP tunnel
 

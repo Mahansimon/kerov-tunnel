@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kerov Tunnel v2.3.4 — Multi-Core Tunnel Manager & Smart Benchmark CLI
+Kerov Tunnel v2.3.10 — Multi-Core Tunnel Manager & Smart Benchmark CLI
 Engines:
   [Reverse] BrokenNode (12 transports incl. ip-spoofing)
             DaggerConnect v4.3.1 (13 transports)
@@ -12,10 +12,12 @@ Engines:
 
 import base64
 import fcntl
+import errno
 import hashlib
 import hmac
 import ipaddress
 from collections import deque
+from contextlib import ExitStack, contextmanager
 from datetime import datetime
 import json
 import tarfile
@@ -45,10 +47,11 @@ from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
-from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.rule import Rule
+from rich.prompt import Confirm as RichConfirm, IntPrompt as RichIntPrompt, Prompt as RichPrompt
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 console = Console()
 
@@ -56,6 +59,7 @@ KEROV_ETC = Path("/etc/kerov")
 META_DIR = KEROV_ETC / "meta"
 TLS_DIR = KEROV_ETC / "tls"
 SYSTEMD_DIR = Path("/etc/systemd/system")
+BENCH_RUNTIME_DIR = Path("/run/systemd/system")
 WATCHDOG_CFG = KEROV_ETC / "watchdog.json"
 BENCH_HISTORY = KEROV_ETC / "bench_history.json"
 SPARK_CHARS = "▁▂▃▄▅▆▇█"
@@ -72,6 +76,8 @@ BINS = {
     "qs-server": "/usr/local/lib/kerov/cores/qs-server",
     "qs-client": "/usr/local/lib/kerov/cores/qs-client",
     "icmp": "/usr/local/lib/kerov/cores/ICMPTunnel",
+    "ctunnel": "/usr/local/bin/ctunnel",
+    "ctunnel-engine": "/usr/local/bin/ctunnel-engine",
 }
 
 BANNER = r"""
@@ -246,10 +252,11 @@ def read_sync_link(prompt_text: str) -> str:
     return "".join(parts)
 
 
-def gen_self_signed_cert(name: str, domain: str):
-    TLS_DIR.mkdir(parents=True, exist_ok=True)
-    cert = TLS_DIR / f"{name}.crt"
-    key = TLS_DIR / f"{name}.key"
+def gen_self_signed_cert(name: str, domain: str, *, directory=None):
+    directory = directory if directory is not None else TLS_DIR
+    directory.mkdir(parents=True, exist_ok=True)
+    cert = directory / f"{name}.crt"
+    key = directory / f"{name}.key"
     domain = _safe_host(domain, "localhost")
     run_cmd([
         "openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "3650", "-nodes",
@@ -269,6 +276,8 @@ def list_tunnels(*, include_retired=False):
             if not include_retired and d.get("engine") == RETIRED_PRIVATE_IP_ENGINE:
                 continue
             svc = d.get("service", f"kerov-{d['name']}")
+            if d.get("engine") == "ctunnel" and d.get("native_name"):
+                svc = d["service"] = _ctunnel_service(d["native_name"])
             st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
             d["status"] = st or "inactive"
             items.append(d)
@@ -284,7 +293,7 @@ def save_meta(meta: dict):
 
 def _protect_instance_name(name: str):
     existing = META_DIR / f"{name}.json"
-    if existing.is_file() and json.loads(existing.read_text(encoding="utf-8")).get("engine") in (RETIRED_PRIVATE_IP_ENGINE, *ADDED_ENGINES):
+    if existing.is_file() and json.loads(existing.read_text(encoding="utf-8")).get("engine") in (RETIRED_PRIVATE_IP_ENGINE, "ctunnel", *ADDED_ENGINES):
         raise ValueError(f"Name '{name}' is already used by a managed tunnel. Choose another name.")
 
 
@@ -295,7 +304,7 @@ def _instance_status(engine: str, status: str, active_label: str = "ACTIVE") -> 
 
 
 def write_systemd(service_name: str, desc: str, exec_start: str, exec_stop: str = "", env_lines=None, oneshot=False, check=False,
-                  service_lines=(), exec_type=False):
+                  service_lines=(), exec_type=False, runtime_directory=None):
     env_block = "\n".join(f"Environment={e}" for e in (env_lines or []))
     svc_type = "oneshot\nRemainAfterExit=yes" if oneshot else f"{'exec' if exec_type else 'simple'}\nRestart=always\nRestartSec=2"
     stop_line = f"ExecStop={exec_stop}" if exec_stop else ""
@@ -318,9 +327,11 @@ TasksMax=infinity
 [Install]
 WantedBy=multi-user.target
 """
-    (SYSTEMD_DIR / f"{service_name}.service").write_text(content, encoding="utf-8")
+    unit_directory = SYSTEMD_DIR if runtime_directory is None else runtime_directory
+    (unit_directory / f"{service_name}.service").write_text(content, encoding="utf-8")
     run_cmd(["systemctl", "daemon-reload"], check=check)
-    run_cmd(["systemctl", "enable", "--now", service_name], check=check)
+    action = ["enable", "--now"] if runtime_directory is None else ["start"]
+    run_cmd(["systemctl", *action, service_name], check=check)
 
 
 def _mini_bar(pct: float, width: int = 10, color: str = "cyan") -> str:
@@ -374,52 +385,75 @@ def _sample_net_mbps(interval: float = 0.25):
     return max(0.0, rx), max(0.0, tx)
 
 
-UI_MAX_W = 80
-KEROV_VERSION = "v2.3.4"
-GOLD = ("#fff1b8", "#ffe08a", "#f5c542", "#e6b422", "#d4a017", "#a8790f")
-G_DIM = "#6b5a2e"
-CREAM = "#f3e9d2"
-MUTED = "#7a7a88"
-OK_C = "#4ade80"
-BAD_C = "#f87171"
-LOGO = (
-    "██╗  ██╗███████╗██████╗  ██████╗ ██╗   ██╗",
-    "██║ ██╔╝██╔════╝██╔══██╗██╔═══██╗██║   ██║",
-    "█████╔╝ █████╗  ██████╔╝██║   ██║██║   ██║",
-    "██╔═██╗ ██╔══╝  ██╔══██╗██║   ██║╚██╗ ██╔╝",
-    "██║  ██╗███████╗██║  ██║╚██████╔╝ ╚████╔╝ ",
-    "╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝ ╚═════╝   ╚═══╝  ",
+UI_MAX_W = 112
+KEROV_VERSION = "v2.3.10"
+if console.color_system in ("256", "truecolor"):
+    ACCENT, DIVIDER = "#ff7861", "#785a50"
+    CREAM, MUTED = "#f3eee7", "#b5ada4"
+    OK_C, BAD_C, WARN_C = CREAM, "#ff654f", "#f6c477"
+else:
+    ACCENT, DIVIDER = "bright_red", "bright_black"
+    CREAM, MUTED = "bright_white", "white"
+    OK_C, BAD_C, WARN_C = CREAM, "red", "yellow"
+
+CLI_THEME = Theme({
+    "cyan": ACCENT, "bold cyan": f"bold {ACCENT}",
+    "magenta": ACCENT, "bold magenta": f"bold {ACCENT}",
+    "green": OK_C, "bold green": f"bold {OK_C}",
+    "red": BAD_C, "bold red": f"bold {BAD_C}",
+    "yellow": WARN_C, "bold yellow": f"bold {WARN_C}",
+    "prompt": f"bold {CREAM}",
+    "prompt.choices": f"bold {ACCENT}",
+    "prompt.default": f"bold {WARN_C}",
+    "prompt.invalid": BAD_C,
+    "prompt.invalid.choice": BAD_C,
+    "status.spinner": ACCENT,
+    "rule.line": DIVIDER,
+})
+console.push_theme(CLI_THEME)
+
+
+class _KerovPrompt:
+    def __init__(self, *args, **kwargs):
+        if kwargs.get("console") is None:
+            kwargs["console"] = console
+        super().__init__(*args, **kwargs)
+
+
+class Prompt(_KerovPrompt, RichPrompt):
+    pass
+
+
+class IntPrompt(_KerovPrompt, RichIntPrompt):
+    pass
+
+
+class Confirm(_KerovPrompt, RichConfirm):
+    pass
+
+KEROV_WORDMARK = (
+    "█  █ ████ ███  ████ █  █   ████ █  █ █  █ █  █ ████ █   ",
+    "█ █  █    █  █ █  █ █  █    ██  █  █ ██ █ ██ █ █    █   ",
+    "██   ███  ███  █  █ █  █    ██  █  █ █ ██ █ ██ ███  █   ",
+    "█ █  █    █ █  █  █  ██     ██  █  █ █  █ █  █ █    █   ",
+    "█  █ ████ █  █ ████  ██     ██  ████ █  █ █  █ ████ ████",
 )
-CHIP_STYLES = {
-    "ok": "bold #86efac on #14532d",
-    "bad": "bold #fda4af on #4c0519",
-    "off": "bold #a1a1aa on #27272a",
-    "info": "bold #f5e3b0 on #3b2f12",
-}
+
+
+def _cli_panel(body, **options):
+    border = options.pop("border_style", "")
+    options["border_style"] = {"red": BAD_C, "yellow": WARN_C, "green": OK_C}.get(border, DIVIDER)
+    options["box"] = box.SQUARE
+    options.setdefault("title_align", "left")
+    return Panel(body, **options)
+
 
 
 def _ui_width() -> int:
     size = shutil.get_terminal_size((80, 24))
-    w = max(60, min(size.columns, UI_MAX_W))
+    w = min(size.columns, UI_MAX_W)
     console.width = w
     return w
-
-
-def _ui_compact() -> bool:
-    return shutil.get_terminal_size((80, 24)).lines < 30 or console.width < 72
-
-
-def _chip(label: str, state: str) -> Text:
-    return Text(f" {label} ", style=CHIP_STYLES[state])
-
-
-def _gold_bar(pct: float, width: int = 10) -> Text:
-    pct = max(0.0, min(100.0, pct))
-    filled = int(round(pct / 100.0 * width))
-    t = Text(no_wrap=True)
-    t.append("━" * filled, style=GOLD[2])
-    t.append("━" * (width - filled), style="#2a2a33")
-    return t
 
 
 def _grade_letter(mbps: float, rtt: float) -> str:
@@ -444,32 +478,11 @@ def _last_winner():
         return None
 
 
-def _render_gradient_banner():
-    t = Text(no_wrap=True)
-    for i, row in enumerate(LOGO):
-        t.append(row.ljust(42), style=f"bold {GOLD[i]}")
-        if i < len(LOGO) - 1:
-            t.append("\n")
-    return t
-
-
-def _tagline(os_name: str) -> Text:
-    t = Text(no_wrap=True, overflow="ellipsis")
-    t.append("T U N N E L\n", style=f"bold {CREAM}")
-    t.append("─" * 13 + "\n", style=G_DIM)
-    t.append("◆ ", style=GOLD[2])
-    t.append("PRO EDITION\n", style=f"bold {GOLD[2]}")
-    t.append(f"{KEROV_VERSION} · 9 engines\n", style=MUTED)
-    t.append(os_name, style=MUTED)
-    return t
-
-
 def render_footer_bar(hints: str = None):
-    text = Text(hints or "01-08 select · C M B L W T S shortcuts · Q quit", style=MUTED, justify="right", no_wrap=True, overflow="ellipsis")
-    console.print(text, justify='right')
+    console.print(Text(hints or "1–8 Select  ·  C M B L W T S Shortcuts  ·  Q Quit", style=MUTED))
 
 
-def render_header():
+def render_header(*, main_menu=False):
     w = _ui_width()
     console.clear()
 
@@ -488,58 +501,27 @@ def render_header():
     installed_cores += int(all(os.access(BINS[k], os.X_OK) for k in ("qs-client", "qs-server")))
     os_name = get_os_name().replace(" LTS", "")
 
-    if _ui_compact():
-        top = Text(no_wrap=True, overflow="ellipsis")
-        top.append("◆ ", style=GOLD[2])
-        top.append("K E R O V", style=f"bold {GOLD[1]}")
-        top.append("  T U N N E L", style=f"bold {CREAM}")
-        top.append(f"   PRO · {KEROV_VERSION} · {os_name}", style=MUTED)
-    else:
-        top = Table.grid(padding=(0, 3))
-        top.add_column(no_wrap=True)
-        top.add_column(vertical="middle", no_wrap=True, overflow="ellipsis")
-        top.add_row(_render_gradient_banner(), _tagline(os_name))
+    if main_menu and w >= 64 and console.height >= 23:
+        console.print(Text("\n".join(KEROV_WORDMARK), style=f"bold {ACCENT}"))
+    heading = Text("KerovTunnel", style=f"bold {CREAM}")
+    heading.append(f"   {KEROV_VERSION} · {os_name}", style=MUTED)
+    console.print(heading)
+    console.print(Rule(style=DIVIDER, characters="═"))
+    status = Text()
+    status.append(f"● {online}/{len(tunnels)} running", style=OK_C if online else MUTED)
+    installed_cores += int(_ctunnel_ready())
+    status.append(f"  ·  {installed_cores}/10 engines  ·  ", style=MUTED)
+    status.append("Watchdog " + ("ON" if wd_active else "OFF"), style=OK_C if wd_active else MUTED)
+    status.append("  ·  ", style=MUTED)
+    status.append("BBR " + ("ON" if bbr == "bbr" else "OFF"), style=OK_C if bbr == "bbr" else MUTED)
+    status.append(f"  ·  {get_public_ip()}", style=CREAM)
+    usage = Text(f"CPU {cpu_pct:.0f}%  ·  RAM {mem.percent:.0f}%  ·  ", style=MUTED)
+    usage.append(f"↓ {rx_mbps:.1f}  ↑ {tx_mbps:.1f} Mbps", style=CREAM)
+    console.print(status)
+    console.print(usage)
+    if w >= 55:
+        console.print(Rule(style=DIVIDER, characters="─"))
 
-    if tunnels:
-        tun_state = "ok" if online == len(tunnels) else "bad"
-    else:
-        tun_state = "off"
-    chips = Text(no_wrap=True, overflow="ellipsis")
-    chips.append_text(_chip(f"● RUNNING {online}/{len(tunnels)}", tun_state))
-    chips.append(" ")
-    chips.append_text(_chip("● WATCHDOG", "ok" if wd_active else "off"))
-    chips.append(" ")
-    chips.append_text(_chip("● BBR", "ok" if bbr == "bbr" else "off"))
-    chips.append(" ")
-    chips.append_text(_chip(f"CORES {installed_cores}/9", "ok" if installed_cores == 9 else "info"))
-
-    row1 = Table.grid(expand=True)
-    row1.add_column(no_wrap=True)
-    row1.add_column(justify="right", no_wrap=True, overflow="ellipsis")
-    row1.add_row(chips, Text(get_public_ip(), style=f"bold {CREAM}"))
-
-    usage = Text(no_wrap=True)
-    usage.append("CPU ", style=MUTED)
-    usage.append_text(_gold_bar(cpu_pct))
-    usage.append(f" {cpu_pct:3.0f}%", style=CREAM)
-    usage.append("   RAM ", style=MUTED)
-    usage.append_text(_gold_bar(mem.percent))
-    usage.append(f" {mem.percent:3.0f}%", style=CREAM)
-    net = Text(no_wrap=True)
-    net.append(f"▼ {rx_mbps:.1f}", style=f"bold {OK_C}")
-    net.append("  ")
-    net.append(f"▲ {tx_mbps:.1f}", style=f"bold {GOLD[2]}")
-    net.append(" Mbps", style=MUTED)
-    row2 = Table.grid(expand=True)
-    row2.add_column(no_wrap=True)
-    row2.add_column(justify="right", no_wrap=True)
-    row2.add_row(usage, net)
-
-    divider = Text("─" * (w - 4), style=G_DIM, no_wrap=True)
-    console.print(Panel(
-        Group(top, divider, row1, row2),
-        box=box.DOUBLE, border_style=GOLD[5], width=w, padding=(0, 1),
-    ))
 
 def pause():
     flush_stdin()
@@ -1172,8 +1154,9 @@ wg-quick down {wg_if} 2>/dev/null || true
 
 def _select_transport(label, options, default):
     numbered = {str(index): option for index, option in enumerate(options, 1)}
-    table = Table(title=label, box=box.ROUNDED, border_style="magenta")
-    table.add_column("#", style="bold cyan", width=4, justify="right")
+    console.print(Rule(_section_title(label.upper()), style=DIVIDER, align="left"))
+    table = Table(box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}")
+    table.add_column("#", style=f"bold {ACCENT}", width=4, justify="right")
     table.add_column("Option", style="bold white")
     for number, option in numbered.items():
         table.add_row(number, option)
@@ -1184,23 +1167,25 @@ def _select_transport(label, options, default):
     return numbered.get(selected, selected)
 
 
-def wizard_added_engine(engine, name, iran_ip, foreign_ip, *, direction="direct"):
+def wizard_added_engine(engine, name, iran_ip, foreign_ip, *, direction="direct", preferred=""):
+    preferred_transport, _, detail = preferred.partition("/")
+    preferred_encap, _, preferred_profile = detail.partition("/")
     cfg = {"name": name, "engine": engine, "direction": direction,
            "iran_ip": iran_ip, "foreign_ip": foreign_ip}
     if engine == "leech":
         host = "Iran" if direction == "reverse" else "Foreign"
-        transport = _select_transport("Leech Transport", LEECH_TRANSPORTS, "tcp")
+        transport = _select_transport("Leech Transport", LEECH_TRANSPORTS, preferred_transport or "tcp")
         cfg.update(transport=transport, token=secrets.token_hex(24),
                    psk=base64.b64encode(secrets.token_bytes(32)).decode("ascii"),
                    license_key=Prompt.ask("Leech license key", password=True, default=LEECH_LICENSE))
         encap = ""
         if transport == "tun":
-            encap = _select_transport("Leech TUN Encapsulation", LEECH_TUN_ENCAPS, "tcp")
+            encap = _select_transport("Leech TUN Encapsulation", LEECH_TUN_ENCAPS, preferred_encap or "tcp")
             cfg["encapsulation"] = encap
             if encap != "tcp" and not foreign_ip:
                 cfg["foreign_ip"] = Prompt.ask("Foreign Server Public IPv4").strip()
             if encap == "ipx":
-                cfg["ipx_profile"] = _select_transport("IPX Profile", LEECH_IPX_PROFILES, "tcp")
+                cfg["ipx_profile"] = _select_transport("IPX Profile", LEECH_IPX_PROFILES, preferred_profile or "tcp")
             octet = 1 + hashlib.sha256(name.encode("ascii")).digest()[0] % 254
             cfg["iran_tun_cidr"] = Prompt.ask("Iran TUN IPv4/CIDR", default=f"10.230.{octet}.1/30")
             cfg["foreign_tun_cidr"] = Prompt.ask("Foreign TUN IPv4/CIDR", default=f"10.230.{octet}.2/30")
@@ -1227,7 +1212,7 @@ def wizard_added_engine(engine, name, iran_ip, foreign_ip, *, direction="direct"
         cfg["ports"] = ask_port_mappings(default_443=False, protocols=("tcp",))
     elif engine == "qs":
         cfg.update(
-            transport=_select_transport("QS Download Transport", QS_TRANSPORTS, "obfs"),
+            transport=_select_transport("QS Download Transport", QS_TRANSPORTS, preferred_transport or "obfs"),
             tunnel_port=IntPrompt.ask("QS upload TCP port on Foreign", default=9000),
             download_src_port=IntPrompt.ask("QS download UDP source port on Foreign", default=9001),
             download_port=IntPrompt.ask("QS download UDP port on Iran", default=8000),
@@ -1273,8 +1258,9 @@ def _leech_tun_device(name):
     return "kl" + hashlib.sha256(name.encode("ascii")).hexdigest()[:12]
 
 
-def _leech_certificate_paths(name):
-    return (TLS_DIR / f"leech-{name}.crt", TLS_DIR / f"leech-{name}.key")
+def _leech_certificate_paths(name, directory=None):
+    directory = directory if directory is not None else TLS_DIR
+    return (directory / f"leech-{name}.crt", directory / f"leech-{name}.key")
 
 
 def _route_to_ipv4(peer):
@@ -1306,7 +1292,7 @@ def _leech_backup_listeners(cfg, primary):
     return endpoints
 
 
-def _leech_plan(cfg, side, role, iran_ip, foreign_ip):
+def _leech_plan(cfg, side, role, iran_ip, foreign_ip, tls_directory=None):
     transport = cfg["transport"]
     if transport not in LEECH_TRANSPORTS:
         raise ValueError("Unsupported Leech transport.")
@@ -1391,7 +1377,7 @@ def _leech_plan(cfg, side, role, iran_ip, foreign_ip):
                 raise ValueError("Invalid AnyTLS server name.")
             tls["sni"] = sni
         if server:
-            cert, key = _leech_certificate_paths(cfg["name"])
+            cert, key = _leech_certificate_paths(cfg["name"], tls_directory)
             tls.update(tls_cert=str(cert), tls_key=str(key))
         if tls:
             sections["tls"] = tls
@@ -1450,7 +1436,7 @@ def _leech_plan(cfg, side, role, iran_ip, foreign_ip):
     return role, "leech", "-c", "toml", config, endpoint, listeners, []
 
 
-def _added_engine_plan(cfg, side):
+def _added_engine_plan(cfg, side, *, tls_directory=None):
     _validate_cfg(cfg)
     engine = cfg["engine"]
     transport = cfg["transport"]
@@ -1465,7 +1451,7 @@ def _added_engine_plan(cfg, side):
     rules = []
     listeners = []
     if engine == "leech":
-        return _leech_plan(cfg, side, role, iran_ip, foreign_ip)
+        return _leech_plan(cfg, side, role, iran_ip, foreign_ip, tls_directory)
 
     socks_port = _added_port(cfg, "socks_port")
     if engine == "qs":
@@ -1553,8 +1539,10 @@ def _write_private(path, content):
         target.write("\n")
 
 
-def deploy_added_engine(cfg, side, sync_link):
-    role, core, flag, ext, contents, endpoint, listeners, rules = _added_engine_plan(cfg, side)
+def deploy_added_engine(cfg, side, sync_link, *, benchmark_directory=None):
+    role, core, flag, ext, contents, endpoint, listeners, rules = _added_engine_plan(
+        cfg, side, tls_directory=benchmark_directory
+    )
     engine, name = cfg["engine"], cfg["name"]
     binary = BINS[core]
     if platform.machine() not in ("x86_64", "amd64"):
@@ -1570,16 +1558,21 @@ def deploy_added_engine(cfg, side, sync_link):
                    for interface in json.loads(rows.stdout) for address in interface.get("addr_info", [])):
             raise ValueError("The QS UDP source IPv4 must be assigned to the Foreign server.")
     service = f"kerov-{engine}-{name}"
-    directory = KEROV_ETC / engine
+    managed_directory = KEROV_ETC / engine
+    directory = managed_directory if benchmark_directory is None else benchmark_directory
+    runtime_directory = BENCH_RUNTIME_DIR if benchmark_directory is not None else None
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    META_DIR.mkdir(parents=True, exist_ok=True)
+    KEROV_ETC.mkdir(parents=True, exist_ok=True)
     path = directory / f"{name}.{ext}"
-    unit = SYSTEMD_DIR / f"{service}.service"
+    unit = (runtime_directory or SYSTEMD_DIR) / f"{service}.service"
     metadata = META_DIR / f"{name}.json"
     service_lines = ["UMask=0077", *_added_firewall(service, rules)]
+    if runtime_directory is not None:
+        service_lines.extend(("Restart=no", "RuntimeMaxSec=360", "TimeoutStopSec=5"))
     if engine == "icmp":
         service_lines.extend(["CapabilityBoundingSet=CAP_NET_RAW", "NoNewPrivileges=yes"])
-    cert_paths = _leech_certificate_paths(name) if engine == "leech" and role == "server" and transport in LEECH_TLS else ()
+    cert_paths = (_leech_certificate_paths(name, benchmark_directory)
+                  if engine == "leech" and role == "server" and transport in LEECH_TLS else ())
     tun_device = ""
     if engine == "leech" and transport == "tun":
         tun_device = _leech_tun_device(name)
@@ -1597,32 +1590,48 @@ def deploy_added_engine(cfg, side, sync_link):
             raise ValueError(f"Name '{name}' is already in use. Choose another name on both servers.")
         if tun_device and run_cmd(["ip", "link", "show", "dev", tun_device]).returncode == 0:
             raise ValueError(f"TUN interface {tun_device} already exists.")
-        if engine == "icmp" and any(directory.glob("*.json")):
-            raise ValueError("Use one ICMP Tunnel instance per server.")
+        if engine == "icmp":
+            existing_icmp = any(managed_directory.glob("*.json"))
+            active_benchmark = any(
+                run_cmd(["systemctl", "is-active", "--quiet", unit.name]).returncode == 0
+                for unit in BENCH_RUNTIME_DIR.glob("kerov-icmp-bench-*.service")
+            )
+            active_upstream = runtime_directory is not None and any(
+                run_cmd(["systemctl", "is-active", "--quiet", f"icmptunnel-{mode}.service"]).returncode == 0
+                for mode in ("server", "client")
+            )
+            if active_benchmark or active_upstream:
+                raise ValueError("An ICMP receiver is already in use.")
+            if existing_icmp:
+                raise ValueError("An ICMP tunnel is already configured. Use Benchmark Managed Tunnel.")
         _check_added_listeners(listeners)
         try:
             if cert_paths:
-                gen_self_signed_cert(f"leech-{name}", cfg.get("sni", "leech.local"))
+                gen_self_signed_cert(f"leech-{name}", cfg.get("sni", "leech.local"), directory=benchmark_directory)
             _write_private(path, contents)
             write_systemd(service, f"{engine} {role} ({name})", f"{binary} {flag} {path}",
-                          check=True, service_lines=service_lines, exec_type=True)
+                          check=True, service_lines=service_lines, exec_type=True, runtime_directory=runtime_directory)
             time.sleep(0.7)
             if run_cmd(["systemctl", "is-active", service]).stdout.strip() != "active":
                 raise RuntimeError("The core exited during startup.")
-            _write_private(metadata, json.dumps({
-                "name": name, "engine": engine, "direction": cfg["direction"],
-                "transport": transport, "role": role, "service": service, "config": str(path),
-                "endpoint": endpoint, "sync_link": sync_link,
-            }, indent=2))
+            if runtime_directory is None:
+                META_DIR.mkdir(parents=True, exist_ok=True)
+                _write_private(metadata, json.dumps({
+                    "name": name, "engine": engine, "direction": cfg["direction"],
+                    "transport": transport, "role": role, "service": service, "config": str(path),
+                    "endpoint": endpoint, "sync_link": sync_link,
+                }, indent=2))
         except (Exception, KeyboardInterrupt) as error:
             logs = ""
             if unit.exists():
-                run_cmd(["systemctl", "disable", "--now", service])
+                action = ["disable", "--now"] if runtime_directory is None else ["stop"]
+                run_cmd(["systemctl", *action, service])
                 logs = run_cmd(["journalctl", "-u", service, "-n", "6", "--no-pager", "-o", "cat"]).stdout.strip()
                 unit.unlink(missing_ok=True)
                 run_cmd(["systemctl", "daemon-reload"])
             path.unlink(missing_ok=True)
-            metadata.unlink(missing_ok=True)
+            if runtime_directory is None:
+                metadata.unlink(missing_ok=True)
             for cert_path in cert_paths:
                 cert_path.unlink(missing_ok=True)
             if logs and not isinstance(error, KeyboardInterrupt):
@@ -1651,14 +1660,232 @@ def _deploy_leech_backup(cfg, link):
     console.print(f"[green]Backup listener {address} configured as {svc}.[/]")
 
 
+CTUNNEL_STATE = Path("/etc/ctunnel")
+CTUNNEL_HELPER = Path("/usr/local/lib/ctunnel/ctunnel-kernel")
+CTUNNEL_L4 = ("tcp", "tcpmux", "pck", "ws", "wsmux", "wss", "wssmux", "udp", "udpmux", "game-kcp")
+CTUNNEL_FRP = ("6to4", "ipip", "gre", "xgre", "xgre-ip")
+CTUNNEL_CRYPTO = ("wg-stealth", "rudp-fec", "faketcp", "icmp", "stealth-tcp", "stealth-ws",
+                  "game-udp", "game-fec", "game-dup", "game-dtls")
+CTUNNEL_REVERSE = CTUNNEL_FRP + CTUNNEL_CRYPTO + CTUNNEL_L4
+CTUNNEL_DIRECT = CTUNNEL_REVERSE + ("ip6gre", "eoip", "vxlan")
+
+
+def _ctunnel_ready():
+    return (os.access(BINS["ctunnel"], os.X_OK) and os.access(BINS["ctunnel-engine"], os.X_OK)
+            and os.access(CTUNNEL_HELPER, os.X_OK))
+
+
+def _ctunnel_state():
+    path = CTUNNEL_STATE / "state.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def _ctunnel_native_name(name, side):
+    prefix = "ir" if side == "iran" else "kh"
+    return f"{prefix}-k{hashlib.sha256(name.encode('ascii')).hexdigest()[:6]}"
+
+
+def _ctunnel_service(native_name):
+    units = (f"ctunnel-engine@{native_name}.service", f"ctunnel@{native_name}.service")
+    for unit in units:
+        if run_cmd(["systemctl", "is-active", "--quiet", unit]).returncode == 0:
+            return unit
+    for unit in units:
+        if run_cmd(["systemctl", "is-enabled", "--quiet", unit]).returncode == 0:
+            return unit
+    return units[0]
+
+
+def _ctunnel_options(direction):
+    if direction == "direct":
+        return CTUNNEL_DIRECT
+    if direction == "reverse":
+        return CTUNNEL_REVERSE
+    raise ValueError("Invalid C-Tunnel direction.")
+
+
+def wizard_ctunnel(name, iran_ip, foreign_ip, direction):
+    choices = _ctunnel_options(direction)
+    method = _select_transport(f"C-Tunnel {direction.title()} Transport", choices, "tcp")
+    v6 = method == "ip6gre"
+    for side, ip in (("Iran", iran_ip), ("Foreign", foreign_ip)):
+        while not _valid_ip(ip) or ipaddress.ip_address(ip).version != (6 if v6 else 4):
+            ip = Prompt.ask(f"{side} Underlay IPv{6 if v6 else 4}").strip()
+        if side == "Iran":
+            iran_ip = ip
+        else:
+            foreign_ip = ip
+    used_indexes = {t["index"] for t in (_ctunnel_state().get("tunnels") or [])}
+    available = [index for index in range(1, 251) if index not in used_indexes]
+    if not available:
+        raise ValueError("No C-Tunnel subnet indexes are free on this server.")
+    index = IntPrompt.ask("C-Tunnel Subnet Index (1-250)", default=secrets.choice(available))
+    profile = Prompt.ask("Performance Profile", choices=["auto", "eco", "turbo", "hyper"], default="auto")
+    port_default = 24000 + index
+    port = 0
+    if method != "icmp":
+        required = method in CTUNNEL_L4 or method in CTUNNEL_CRYPTO or method == "vxlan"
+        carrier = method in CTUNNEL_FRP and (direction == "reverse" or profile in ("turbo", "hyper"))
+        if required or carrier or method in CTUNNEL_FRP:
+            port = IntPrompt.ask("Transport Port (0 = native default / raw)", default=port_default if required or carrier else 0)
+    cfg = {"name": name, "engine": "ctunnel", "direction": direction, "transport": method,
+           "iran_ip": iran_ip, "foreign_ip": foreign_ip, "token": secrets.token_hex(32),
+           "ct_index": index, "ct_port": port, "ct_profile": profile,
+           "ports": ask_port_mappings(default_443=False, protocols=("tcp",))}
+    if method in ("gre", "ip6gre", "xgre", "xgre-ip"):
+        cfg["ct_lanes"] = IntPrompt.ask("ECMP Lanes", default=4 if method in ("xgre", "xgre-ip") else 1)
+    if method.startswith("ws") or method == "stealth-ws":
+        cfg["ct_sni"] = Prompt.ask("TLS / WebSocket Host (optional)", default="")
+    if method not in CTUNNEL_L4:
+        cfg["ct_mtu"] = IntPrompt.ask("Tunnel MTU (0 = native default)", default=0)
+    if Confirm.ask("Configure advanced C-Tunnel settings?", default=False):
+        if method not in CTUNNEL_L4:
+            cfg["ct_iran_tun"] = Prompt.ask("Iran Tunnel IPv4", default=f"10.77.{index}.1").strip()
+            cfg["ct_foreign_tun"] = Prompt.ask("Foreign Tunnel IPv4", default=f"10.77.{index}.2").strip()
+        if method in CTUNNEL_CRYPTO:
+            cfg["ct_padding"] = IntPrompt.ask("Packet Padding (0 = native default)", default=0)
+        if method == "eoip":
+            cfg["ct_tunnel_id"] = IntPrompt.ask("EoIP Tunnel ID", default=100 + index)
+        if method == "vxlan":
+            cfg["ct_vni"] = IntPrompt.ask("VXLAN VNI (0 = derive from tunnel key)", default=0)
+        cfg["ct_rate"] = IntPrompt.ask("Rate Limit (Mbps, 0 = unlimited)", default=0)
+        cfg["ct_quota"] = IntPrompt.ask("Traffic Quota (GiB, 0 = unlimited)", default=0)
+        alternatives = [m for m in choices if m != method and (m in CTUNNEL_L4) == (method in CTUNNEL_L4)
+                        and (m == "ip6gre") == v6]
+        if alternatives:
+            cfg["ct_backup"] = Prompt.ask("Backup Transport", choices=["off", *alternatives], default="off")
+            if cfg["ct_backup"] != "off":
+                cfg["ct_backup_port"] = IntPrompt.ask("Backup Port (0 = native default)", default=0)
+    return cfg
+
+
+def _ctunnel_payload(cfg, side):
+    _validate_cfg(cfg)
+    name, transport, direction = cfg["name"], cfg["transport"], cfg["direction"]
+    choices = _ctunnel_options(direction)
+    if transport not in choices:
+        raise ValueError(f"C-Tunnel {transport} does not support {direction} in this release.")
+    if side not in ("iran", "foreign"):
+        raise ValueError("Invalid C-Tunnel side.")
+    expected = 6 if transport == "ip6gre" else 4
+    addresses = [ipaddress.ip_address(cfg[f"{host}_ip"]) for host in ("iran", "foreign")]
+    if any(ip.version != expected or ip.is_unspecified or ip.is_multicast or ip.is_loopback for ip in addresses):
+        raise ValueError(f"C-Tunnel {transport} needs unicast IPv{expected} underlay addresses.")
+    local, remote = addresses if side == "iran" else addresses[::-1]
+    index, port = int(cfg["ct_index"]), int(cfg.get("ct_port", 0))
+    if not 1 <= index <= 250 or not 0 <= port <= 65535:
+        raise ValueError("C-Tunnel index or port out of range.")
+    token = _added_secret(cfg["token"], 64)
+    forwards = cfg.get("ports") or []
+    if any(p["proto"] != "tcp" for p in forwards):
+        raise ValueError("Use C-Tunnel port mappings from the Kerov wizard.")
+    if cfg.get("ct_backup", "off") != "off":
+        backup = cfg["ct_backup"]
+        if (backup not in choices or backup == transport or (backup in CTUNNEL_L4) != (transport in CTUNNEL_L4)
+                or (backup == "ip6gre") != (transport == "ip6gre")):
+            raise ValueError("Invalid C-Tunnel backup transport.")
+    else:
+        backup = ""
+    peer = "foreign" if side == "iran" else "iran"
+    tun_local = cfg.get(f"ct_{side}_tun", "")
+    tun_remote = cfg.get(f"ct_{peer}_tun", "")
+    for value in (tun_local, tun_remote):
+        if value:
+            _added_ipv4(value)
+    tunnel_id = int(cfg.get("ct_tunnel_id", 0))
+    vni = int(cfg.get("ct_vni", 0))
+    if not 0 <= tunnel_id <= 65535 or not 0 <= vni <= 16777215:
+        raise ValueError("C-Tunnel Tunnel ID or VNI out of range.")
+    return dict(name=_ctunnel_native_name(name, side), role="iran" if side == "iran" else "kharej",
+                index=index, method=transport, local_ip=str(local), remote_ip=str(remote), port=port, token=token,
+                reverse=direction == "reverse", direct_l4=direction == "direct" and transport in CTUNNEL_L4,
+                profile=cfg.get("ct_profile", "auto"), lanes=int(cfg.get("ct_lanes", 0)),
+                mtu=int(cfg.get("ct_mtu", 0)), sni=cfg.get("ct_sni", ""),
+                tun_local4=tun_local, tun_remote4=tun_remote, tunnel_id=tunnel_id, vni=vni,
+                padding=int(cfg.get("ct_padding", 0)),
+                rate_mbps=int(cfg.get("ct_rate", 0)), quota_gb=int(cfg.get("ct_quota", 0)),
+                backup_method=backup, backup_port=int(cfg.get("ct_backup_port", 0)),
+                ports=[f"{p['bind']}={p['target']}" for p in forwards] if side == "iran" else [])
+
+
+def _remove_ctunnel_native(native_name):
+    if not re.fullmatch(r"(?:ir|kh)-k[a-f0-9]{6}", native_name):
+        raise ValueError("Invalid Kerov C-Tunnel instance.")
+    units = (f"ctunnel-engine@{native_name}.service", f"ctunnel@{native_name}.service")
+    for unit in units:
+        run_cmd(["systemctl", "disable", "--now", unit])
+    if any(run_cmd(["systemctl", "is-active", "--quiet", unit]).returncode == 0 for unit in units):
+        raise RuntimeError("C-Tunnel instance could not be stopped.")
+    env_path = CTUNNEL_STATE / "tunnels" / f"{native_name}.env"
+    if env_path.exists():
+        run_cmd([str(CTUNNEL_HELPER), "down", native_name], check=True)
+    state = _ctunnel_state()
+    entries = state.get("tunnels") or []
+    if any(row.get("name") == native_name for row in entries):
+        state["tunnels"] = [row for row in entries if row.get("name") != native_name]
+        _write_ctunnel_json(CTUNNEL_STATE / "state.json", state)
+    env_path.unlink(missing_ok=True)
+
+
+def _write_ctunnel_json(path, data):
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, mode="w", encoding="utf-8", delete=False) as stage:
+        pending = Path(stage.name)
+        try:
+            json.dump(data, stage, indent=2)
+            stage.flush()
+            os.replace(pending, path)
+        finally:
+            pending.unlink(missing_ok=True)
+
+
+def deploy_ctunnel(cfg, side, link, *, update=False):
+    if not _ctunnel_ready():
+        raise RuntimeError("C-Tunnel core missing. Rerun kerov-install.sh with GitHub access.")
+    native = _ctunnel_payload(cfg, side)
+    name = cfg["name"]
+    native_name = native["name"]
+    config_path = KEROV_ETC / "ctunnel" / f"{name}.json"
+    meta_path = META_DIR / f"{name}.json"
+    KEROV_ETC.mkdir(parents=True, exist_ok=True)
+    with (KEROV_ETC / ".ctunnel.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not update and (meta_path.exists() or config_path.exists()
+                or any(row.get("name") == native_name for row in (_ctunnel_state().get("tunnels") or []))):
+            raise ValueError("Choose a new C-Tunnel instance name.")
+        raw = base64.urlsafe_b64encode(json.dumps(native, separators=(",", ":")).encode()).decode().rstrip("=")
+        result = run_cmd([BINS["ctunnel"], "apply-link", "ctunnel://" + raw])
+        if result.returncode:
+            if not update and any(row.get("name") == native_name for row in (_ctunnel_state().get("tunnels") or [])):
+                _remove_ctunnel_native(native_name)
+            raise RuntimeError(result.stderr.strip() or "C-Tunnel could not apply the configuration.")
+        if (SYSTEMD_DIR / "ctunnel-agent.service").is_file():
+            agent = run_cmd(["systemctl", "enable", "--now", "ctunnel-agent.service"])
+            if agent.returncode:
+                console.print(Text("C-Tunnel agent failed to start. Automatic profiles, quotas and failover need the agent.", style=WARN_C))
+        service = _ctunnel_service(native_name)
+        try:
+            _write_ctunnel_json(config_path, cfg)
+            _write_ctunnel_json(meta_path, {
+                "name": name, "role": side, "engine": "ctunnel", "direction": cfg["direction"],
+                "transport": cfg["transport"], "config": str(config_path), "service": service,
+                "native_name": native_name, "endpoint": native["remote_ip"], "sync_link": link,
+            })
+        except OSError:
+            if not update:
+                _remove_ctunnel_native(native_name)
+                config_path.unlink(missing_ok=True)
+            raise
+    return service
+
+
 def create_tunnel_menu():
     render_header()
-    console.print(Panel(
-        "[bold cyan][1][/] [white]Iran Server[/]    [dim]Configure tunnel & generate auto-sync [cyan]kerov://[/] link[/]\n"
-        "[bold green][2][/] [white]Foreign Server[/] [dim]Paste [cyan]kerov://[/] link — auto-configures everything[/]\n"
-        "[bold yellow][3][/] [white]Leech Backup Listener[/] [dim]Configure a backup using the same sync link[/]\n"
-        "[bold dim][0][/] [dim]Back to Main Menu[/]",
-        title="[bold magenta]CREATE TUNNEL — SELECT SERVER ROLE[/]", border_style="magenta", box=box.ROUNDED
+    _print_cli_options("CREATE TUNNEL / SERVER ROLE", (
+        ("1", "Iran Server", "Create a tunnel and generate a sync link"),
+        ("2", "Foreign Server", "Apply a kerov:// link"),
+        ("3", "Leech Backup Listener", "Apply a sync link to a backup"),
+        ("0", "Back", ""),
     ))
     side_choice = Prompt.ask("[bold cyan]kerov > Select[/]", choices=["0", "1", "2", "3"], default="1")
     if side_choice == "0":
@@ -1702,7 +1929,7 @@ def create_tunnel_menu():
         eng = cfg["engine"]
         if eng not in ADDED_ENGINES and not cfg.get("foreign_ip"):
             cfg["foreign_ip"] = get_public_ip()
-        console.print(Panel(
+        console.print(_cli_panel(
             f"[cyan]Name:[/] {cfg['name']}   [cyan]Engine:[/] {eng}   [cyan]Direction:[/] {cfg['direction'].upper()}\n"
             f"[cyan]Transport:[/] {cfg['transport']}   [cyan]Iran IP:[/] {cfg.get('iran_ip') or cfg.get('iran_tun_ip', '-')}",
             title="[bold green]DECODED SYNC PAYLOAD[/]", border_style="green", box=box.ROUNDED
@@ -1722,6 +1949,8 @@ def create_tunnel_menu():
                     svc = deploy_gretap_ipsec(cfg, "foreign", clean_link)
                 elif eng == "kerov-udp":
                     svc = deploy_kerov_udp(cfg, "foreign", clean_link)
+                elif eng == "ctunnel":
+                    svc = deploy_ctunnel(cfg, "foreign", clean_link)
                 elif eng in ADDED_ENGINES:
                     svc = deploy_added_engine(cfg, "foreign", clean_link)
                 else:
@@ -1735,20 +1964,17 @@ def create_tunnel_menu():
             console.print(f"\n[bold {color}]● Tunnel '{cfg['name']}' deployed on Foreign server — Status: {label}[/]")
             if st != "active":
                 logs = run_cmd(["journalctl", "-u", svc, "-n", "8", "--no-pager"]).stdout
-                console.print(Panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
+                console.print(_cli_panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
         except Exception as e:
             console.print(f"\n[bold red]✗ Deployment failed:[/] {e}")
             console.print(f"[dim]{traceback.format_exc()}[/]")
         pause()
         return
 
-    console.print(Panel(
-        "[bold magenta][1] REVERSE Tunnels[/]  [yellow](Iran = Server  |  Foreign = Client)[/]\n"
-        "    [dim]• BrokenNode (12 Transports)   • DaggerConnect (13 Transports)   • Backhaul Premium (10 Transports)   • LeechTunnel[/]\n\n"
-        "[bold cyan][2] DIRECT Tunnels[/]   [green](Iran = Client  |  Foreign = Server)[/]\n"
-        "    [dim]• paqet-plus (Raw TCP+KCP)     • GRE over IPsec L2 (gretap)      • Kerov-UDP (FakeTCP+WG)   • QS-Tunnel   • ICMP Tunnel[/]\n\n"
-        "[dim][0] Back[/]",
-        title="[bold cyan]STEP 1: SELECT TUNNEL DIRECTION[/]", border_style="cyan", box=box.ROUNDED
+    _print_cli_options("CREATE TUNNEL / DIRECTION", (
+        ("1", "Reverse", "Iran listens · Foreign connects"),
+        ("2", "Direct", "Foreign listens · Iran connects"),
+        ("0", "Back", ""),
     ))
     dir_choice = Prompt.ask("[bold cyan]kerov > Direction[/]", choices=["0", "1", "2"], default="1")
     if dir_choice == "0":
@@ -1782,7 +2008,7 @@ def create_tunnel_menu():
     console.print(f"\n[bold {color}]● Iran Tunnel '{name}' Configured![/]  Service: [cyan]{svc}[/]  Status: [bold]{label}[/]")
     if st != "active":
         logs = run_cmd(["journalctl", "-u", svc, "-n", "8", "--no-pager"]).stdout
-        console.print(Panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
+        console.print(_cli_panel(logs or "(no logs)", title="[red]Recent Service Logs[/]", border_style="red"))
     print_copyable_link(
         "AUTO-SYNC LINK READY",
         sync_link,
@@ -1793,14 +2019,14 @@ def create_tunnel_menu():
 
 def _iran_engine_flow(dir_choice: str, name: str, iran_ip: str):
     if dir_choice == "1":
-        console.print(Panel(
-            "[bold cyan][1][/] [white]BrokenNode[/]       [dim]Reverse (Iran=Server | Foreign=Client) • 12 Transports[/]\n"
-            "[bold cyan][2][/] [white]DaggerConnect[/]    [dim]Reverse (Iran=Server | Foreign=Client) • 13 Transports[/]\n"
-            "[bold cyan][3][/] [white]Backhaul Premium[/] [dim]Reverse (Iran=Server | Foreign=Client) • 10 Transports (incl. AnyTLS & IPX)[/]\n"
-            "[bold cyan][4][/] [white]LeechTunnel[/]       [dim]14 transports, including TUN[/]",
-            title="[bold magenta]REVERSE TUNNEL ENGINES[/]", border_style="magenta", box=box.ROUNDED
+        _print_cli_options("REVERSE / ENGINE", (
+            ("1", "BrokenNode", "12 transports"),
+            ("2", "DaggerConnect", "13 transports"),
+            ("3", "Backhaul Premium", "10 transports · AnyTLS & IPX"),
+            ("4", "LeechTunnel", "14 transports · TUN"),
+            ("5", "C-Tunnel", "Native Reverse transports"),
         ))
-        eng_c = Prompt.ask("Select Engine", choices=["1", "2", "3", "4"], default="1")
+        eng_c = Prompt.ask("Select Engine", choices=["1", "2", "3", "4", "5"], default="1")
         if eng_c == "1":
             cfg = wizard_brokennode(name, iran_ip)
             sync_link = encode_link("kerov", cfg)
@@ -1813,21 +2039,25 @@ def _iran_engine_flow(dir_choice: str, name: str, iran_ip: str):
             cfg = wizard_backhaul(name, iran_ip)
             sync_link = encode_link("kerov", cfg)
             svc = deploy_backhaul(cfg, "iran", sync_link)
+        elif eng_c == "5":
+            cfg = wizard_ctunnel(name, iran_ip, "", "reverse")
+            sync_link = encode_link("kerov", cfg)
+            svc = deploy_ctunnel(cfg, "iran", sync_link)
         else:
             cfg = wizard_added_engine("leech", name, iran_ip, "", direction="reverse")
             sync_link = encode_link("kerov", cfg)
             svc = deploy_added_engine(cfg, "iran", sync_link)
     else:
-        console.print(Panel(
-            "[bold cyan][1][/] [white]paqet-plus[/]         [dim]Direct (Iran=Client | Foreign=Server) • Raw TCP + KCP/smux[/]\n"
-            "[bold cyan][2][/] [white]GRE over IPsec L2[/]  [dim]Direct (Iran=Client | Foreign=Server) • StrongSwan IKEv2 + GRETAP[/]\n"
-            "[bold cyan][3][/] [white]Kerov-UDP Special[/]  [dim]Direct (Iran=Client | Foreign=Server) • udp2raw FakeTCP + WireGuard[/]\n"
-            "[bold cyan][4][/] [white]QS-Tunnel[/]         [dim]TCP upload + UDP / OBFS download[/]\n"
-            "[bold cyan][5][/] [white]ICMP Tunnel[/]       [dim]IPv4 ICMP + SOCKS5[/]\n"
-            "[bold cyan][6][/] [white]LeechTunnel[/]       [dim]14 transports, including TUN[/]",
-            title="[bold cyan]DIRECT TUNNEL ENGINES[/]", border_style="cyan", box=box.ROUNDED
+        _print_cli_options("DIRECT / ENGINE", (
+            ("1", "paqet-plus", "Raw TCP + KCP/smux"),
+            ("2", "GRE over IPsec L2", "StrongSwan IKEv2 + GRETAP"),
+            ("3", "Kerov-UDP Special", "udp2raw FakeTCP + WireGuard"),
+            ("4", "QS-Tunnel", "TCP upload · UDP / OBFS download"),
+            ("5", "ICMP Tunnel", "IPv4 ICMP · SOCKS5"),
+            ("6", "LeechTunnel", "14 transports · TUN"),
+            ("7", "C-Tunnel", "Native Direct transports"),
         ))
-        eng_c = Prompt.ask("Select Engine", choices=["1", "2", "3", "4", "5", "6"], default="1")
+        eng_c = Prompt.ask("Select Engine", choices=["1", "2", "3", "4", "5", "6", "7"], default="1")
         foreign_ip = ""
         while not _valid_ip(foreign_ip):
             foreign_ip = Prompt.ask("Foreign Server Public IP").strip()
@@ -1845,6 +2075,10 @@ def _iran_engine_flow(dir_choice: str, name: str, iran_ip: str):
             cfg = wizard_kerov_udp(name, iran_ip, foreign_ip)
             sync_link = encode_link("kerov", cfg)
             svc = deploy_kerov_udp(cfg, "iran", sync_link)
+        elif eng_c == "7":
+            cfg = wizard_ctunnel(name, iran_ip, foreign_ip, "direct")
+            sync_link = encode_link("kerov", cfg)
+            svc = deploy_ctunnel(cfg, "iran", sync_link)
         else:
             engine = {"4": "qs", "5": "icmp", "6": "leech"}[eng_c]
             cfg = wizard_added_engine(engine, name, iran_ip, foreign_ip)
@@ -1868,8 +2102,9 @@ def wizard_brokennode(name: str, iran_ip: str) -> dict:
         ("quicd", "QUIC: TCP=streams, UDP=datagrams (gaming)"),
         ("spoof", "Spoofed-IP TUN (blackout / whitelist)"),
     ]
-    tbl = Table(title="BrokenNode Transports [Reverse: Iran=Server | Foreign=Client]", box=box.ROUNDED, border_style="magenta")
-    tbl.add_column("#", style="bold cyan", width=4)
+    console.print(Rule(_section_title("BROKENNODE / TRANSPORT"), style=DIVIDER, align="left"))
+    tbl = Table(box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}")
+    tbl.add_column("#", style=f"bold {ACCENT}", width=4)
     tbl.add_column("Transport", style="bold white", width=12)
     tbl.add_column("Features", style="dim")
     for idx, (t, desc) in enumerate(transports, 1):
@@ -1904,7 +2139,10 @@ def wizard_brokennode(name: str, iran_ip: str) -> dict:
         "4": [5, "gaming", 10, 4],
         "5": [20, "normal", 10, 1],
     }
-    console.print("[cyan]Presets:[/] 1) Optimized  2) High-Speed  3) Stable  4) Low-Latency  5) Eco")
+    _print_cli_options("BROKENNODE / PRESET", (
+        ("1", "Optimized", ""), ("2", "High-Speed", ""), ("3", "Stable", ""),
+        ("4", "Low-Latency", ""), ("5", "Eco", ""),
+    ))
     p_c = Prompt.ask("Select Preset", choices=["1", "2", "3", "4", "5"], default="1")
     extra = {}
     if tr in ("ws", "wsobf"):
@@ -1943,8 +2181,9 @@ def wizard_dagger(name: str, iran_ip: str) -> dict:
         ("dc6", "IPv6 tunnel with IPv4 licensing"),
         ("nova", "Nova high-resilience carrier"),
     ]
-    tbl = Table(title="DaggerConnect Transports [Reverse: Iran=Server | Foreign=Client]", box=box.ROUNDED, border_style="magenta")
-    tbl.add_column("#", style="bold cyan", width=4)
+    console.print(Rule(_section_title("DAGGERCONNECT / TRANSPORT"), style=DIVIDER, align="left"))
+    tbl = Table(box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}")
+    tbl.add_column("#", style=f"bold {ACCENT}", width=4)
     tbl.add_column("Transport", style="bold white", width=16)
     tbl.add_column("Features", style="dim")
     for idx, (t, desc) in enumerate(transports, 1):
@@ -2017,8 +2256,9 @@ def wizard_backhaul(name: str, iran_ip: str) -> dict:
         ("anytls", "AnyTLS with custom SNI & auto TLS cert"),
         ("tun", "TUN Tunnel (TCP or IPX: icmp/ipip/udp/tcp/gre/bip + AEAD)"),
     ]
-    tbl = Table(title="Backhaul Premium Transports [Reverse: Iran=Server | Foreign=Client]", box=box.ROUNDED, border_style="magenta")
-    tbl.add_column("#", style="bold cyan", width=4)
+    console.print(Rule(_section_title("BACKHAUL PREMIUM / TRANSPORT"), style=DIVIDER, align="left"))
+    tbl = Table(box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}")
+    tbl.add_column("#", style=f"bold {ACCENT}", width=4)
     tbl.add_column("Transport", style="bold white", width=12)
     tbl.add_column("Features", style="dim")
     for idx, (t, desc) in enumerate(transports, 1):
@@ -2159,7 +2399,7 @@ def manage_tunnels_menu():
     while True:
         render_header()
         tunnels = list_tunnels(include_retired=True)
-        tbl = Table(title="MANAGED TUNNELS", box=box.ROUNDED, border_style="cyan", expand=True)
+        tbl = Table(title=_section_title("MANAGED TUNNELS"), box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}", expand=True)
         tbl.add_column("#", style="bold cyan", width=4)
         tbl.add_column("Name", style="bold white")
         tbl.add_column("Engine", style="magenta")
@@ -2196,16 +2436,23 @@ def manage_tunnels_menu():
         svc = t["service"]
 
         while True:
+            if t["engine"] == "ctunnel":
+                svc = _ctunnel_service(t["native_name"])
             st = run_cmd(["systemctl", "is-active", svc]).stdout.strip()
             label = _instance_status(t["engine"], st)
-            st_badge = f"[bold green]{label}[/]" if st == "active" else f"[bold red]{label}[/]"
-            console.print(Panel(
-                f"[bold white]{t['name']}[/]  ([magenta]{t['engine']}[/] / [cyan]{t['transport']}[/])   Status: {st_badge}\n"
-                f"[dim]Service: {svc}   Config: {t['config']}[/]\n\n"
-                "[green][1] Start[/]   [yellow][2] Stop[/]   [cyan][3] Restart[/]\n"
-                "[white][4] Live Logs[/]   [white][5] Edit Config[/]   [bold cyan][6] Show Sync Link (kerov://)[/]\n"
-                "[bold red][7] Delete Tunnel[/]   [dim][0] Back to Tunnel List   [m] Main Menu[/]",
-                title=f"[bold cyan]MANAGE: {t['name']}[/]", border_style="cyan", box=box.ROUNDED
+            console.print(Text(f"{t['name']}  ·  {t['engine']} / {t['transport']}  ·  {label}",
+                               style=f"bold {CREAM}"))
+            console.print(Text(f"Service: {svc}  ·  Config: {t['config']}", style=MUTED))
+            _print_cli_options("MANAGE TUNNEL", (
+                ("1", "Start", ""),
+                ("2", "Stop", ""),
+                ("3", "Restart", ""),
+                ("4", "Live Logs", ""),
+                ("5", "Edit Config", ""),
+                ("6", "Show Sync Link", "kerov://"),
+                ("7", "Delete Tunnel", ""),
+                ("0", "Back to Tunnel List", ""),
+                ("m", "Main Menu", ""),
             ))
             act = Prompt.ask("Action", choices=["0", "1", "2", "3", "4", "5", "6", "7", "m"], default="0")
             if act == "0":
@@ -2214,21 +2461,41 @@ def manage_tunnels_menu():
                 return
             elif act in ("1", "2", "3"):
                 action, label = {"1": ("start", "Started"), "2": ("stop", "Stopped"), "3": ("restart", "Restarted")}[act]
-                result = run_cmd(["systemctl", action, svc])
+                if t["engine"] == "ctunnel":
+                    native_action = {"start": "up", "stop": "down", "restart": "restart"}[action]
+                    result = run_cmd([BINS["ctunnel"], native_action, t["native_name"]])
+                else:
+                    result = run_cmd(["systemctl", action, svc])
                 if result.returncode:
                     console.print(Text(result.stderr.strip() or f"Could not {action} {svc}.", style="red"))
                 else:
                     console.print(f"[green]✔ {label}.[/]")
             elif act == "4":
                 console.print("[dim]Press Ctrl+C to stop following logs...[/]")
+                units = [svc]
+                if t["engine"] == "ctunnel":
+                    native_name = t["native_name"]
+                    units = [f"ctunnel@{native_name}.service", f"ctunnel-engine@{native_name}.service"]
+                args = [arg for unit in units for arg in ("-u", unit)]
                 try:
-                    subprocess.run(["journalctl", "-u", svc, "-n", "40", "-f"])
+                    subprocess.run(["journalctl", *args, "-n", "40", "-f"])
                 except KeyboardInterrupt:
                     pass
             elif act == "5":
                 ed = shutil.which("nano") or shutil.which("vi") or "vi"
                 subprocess.run([ed, t["config"]])
                 if Confirm.ask("Restart tunnel to apply changes?", default=True):
+                    if t["engine"] == "ctunnel":
+                        try:
+                            cfg = json.loads(Path(t["config"]).read_text(encoding="utf-8"))
+                            if cfg["name"] != t["name"] or cfg["engine"] != "ctunnel":
+                                raise ValueError("The managed name and engine cannot be edited.")
+                            link = encode_link("kerov", cfg)
+                            deploy_ctunnel(cfg, t["role"], link, update=True)
+                            t["sync_link"], t["transport"], t["direction"] = link, cfg["transport"], cfg["direction"]
+                        except (ValueError, OSError, TypeError, KeyError, RuntimeError, subprocess.CalledProcessError) as error:
+                            console.print(Text(str(error), style=BAD_C))
+                        continue
                     result = run_cmd(["systemctl", "restart", svc])
                     if result.returncode:
                         console.print(Text(result.stderr.strip() or f"Could not restart {svc}.", style="red"))
@@ -2310,6 +2577,17 @@ BASE_BENCH_CASES = [
 
 BENCH_CHUNK = 65536
 BENCH_PAYLOAD_SIZE = 48 * BENCH_CHUNK
+BENCH_PEER_WAIT = 300
+BENCH_CONTROL_TIMEOUT = 300
+BENCH_IO_TIMEOUT = 25
+BENCH_TRANSFER_LIMIT = 100
+
+
+def _bench_transfer_timeout(conn, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("Benchmark transfer exceeded its time budget.")
+    conn.settimeout(min(remaining, BENCH_IO_TIMEOUT))
 
 
 def _bench_read_exact(conn, size):
@@ -2334,21 +2612,24 @@ def _bench_request(conn, command, key):
 def _handle_bench_echo(conn, key=None):
     with conn:
         try:
-            conn.settimeout(6)
+            conn.settimeout(BENCH_IO_TIMEOUT)
             command = _bench_read_exact(conn, 4)
             if key is not None:
                 nonce = _bench_read_exact(conn, 16)
                 digest = _bench_read_exact(conn, 32)
                 if not hmac.compare_digest(digest, hmac.digest(key, nonce + command, "sha256")):
                     return False
+            deadline = time.monotonic() + BENCH_TRANSFER_LIMIT
             if command == b"PING":
                 conn.sendall(b"PONG")
             elif command == b"BULK":
                 chunk = b"K" * BENCH_CHUNK
                 for _ in range(BENCH_PAYLOAD_SIZE // BENCH_CHUNK):
+                    _bench_transfer_timeout(conn, deadline)
                     conn.sendall(chunk)
             elif command == b"UPLD":
                 for _ in range(BENCH_PAYLOAD_SIZE // BENCH_CHUNK):
+                    _bench_transfer_timeout(conn, deadline)
                     _bench_read_exact(conn, BENCH_CHUNK)
                 conn.sendall(b"DONE")
                 return True
@@ -2371,42 +2652,52 @@ def _start_echo_sink(port: int, stop_ev: threading.Event):
                 continue
 
 
-def _probe_local_port(port: int, *, dial=None, key=None):
+def _probe_local_port(port: int, *, dial=None, key=None, on_progress=None):
     if dial is None:
         def dial(timeout):
             return socket.create_connection(("127.0.0.1", port), timeout=timeout)
 
     rtts = []
     lost = 0
+    if on_progress:
+        on_progress("ECHO", 0)
     for _ in range(5):
         t0 = time.perf_counter()
         try:
-            with dial(2.5) as conn:
+            with dial(6) as conn:
                 _bench_request(conn, b"PING", key)
                 if _bench_read_exact(conn, 4) != b"PONG":
                     raise OSError("Invalid benchmark response.")
                 rtts.append((time.perf_counter() - t0) * 1000.0)
         except (OSError, EOFError):
             lost += 1
+        if on_progress:
+            on_progress("ECHO", len(rtts))
         if lost >= 2 and not rtts:
             return None
         time.sleep(0.08)
 
     dl_mbps = 0.0
     ul_mbps = 0.0
-    for command in (b"BULK", b"UPLD"):
+    for command, phase in ((b"BULK", "DOWNLOAD"), (b"UPLD", "UPLOAD")):
+        if on_progress:
+            on_progress(phase, len(rtts), dl_mbps if command == b"UPLD" else None)
         try:
             t0 = time.perf_counter()
-            with dial(4.0) as conn:
-                conn.settimeout(6.0)
+            with dial(10) as conn:
+                deadline = time.monotonic() + BENCH_TRANSFER_LIMIT
+                _bench_transfer_timeout(conn, deadline)
                 _bench_request(conn, command, key)
                 if command == b"BULK":
                     for _ in range(BENCH_PAYLOAD_SIZE // BENCH_CHUNK):
+                        _bench_transfer_timeout(conn, deadline)
                         _bench_read_exact(conn, BENCH_CHUNK)
                 else:
                     payload = b"U" * BENCH_CHUNK
                     for _ in range(BENCH_PAYLOAD_SIZE // BENCH_CHUNK):
+                        _bench_transfer_timeout(conn, deadline)
                         conn.sendall(payload)
+                    _bench_transfer_timeout(conn, deadline)
                     if _bench_read_exact(conn, 4) != b"DONE":
                         raise OSError("The peer did not acknowledge the upload.")
             rate = (BENCH_PAYLOAD_SIZE * 8.0) / (max(time.perf_counter() - t0, 0.001) * 1_000_000.0)
@@ -2719,7 +3010,7 @@ def _show_bench_history():
         hist = json.loads(BENCH_HISTORY.read_text(encoding="utf-8"))
     except Exception:
         hist = []
-    tbl = Table(title="📜 BENCHMARK HISTORY (LAST 15 RUNS)", box=box.ROUNDED, border_style="cyan", expand=True)
+    tbl = Table(title=_section_title("BENCHMARK HISTORY (LAST 15 RUNS)"), box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}", expand=True)
     tbl.add_column("Date & Time", style="dim")
     tbl.add_column("Peer IP", style="white")
     tbl.add_column("Mode", style="yellow")
@@ -2728,11 +3019,14 @@ def _show_bench_history():
     tbl.add_column("RTT", style="white")
     for h in hist:
         w = h.get("winner") or h.get("measurement", {})
+        method = Text(f"{w.get('engine', '-')} / {w.get('transport', '-')}")
+        if h.get("winner") and w.get("engine") == "kerov-udp":
+            method.append(" · estimate", style=WARN_C)
         tbl.add_row(
             h.get("ts", "-"),
             h.get("foreign_ip", "-"),
             h.get("mode", "full"),
-            f"{w.get('engine','-')} / {w.get('transport','-')}",
+            method,
             f"{w.get('mbps',0):.1f} / {w.get('ul_mbps',0):.1f} Mbps",
             f"{w.get('rtt',0):.1f} ms",
         )
@@ -2743,7 +3037,7 @@ def _show_bench_history():
 def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=None):
     eng = best["engine"]
     tr = best["transport"]
-    console.print(Panel(
+    console.print(_cli_panel(
         f"[bold green]1-CLICK DEPLOY WINNER:[/] [bold white]{eng.upper()}[/] → [bold cyan]{tr}[/]\n"
         f"[dim]Iran IP: {iran_ip}   Foreign IP: {foreign_ip}[/]",
         border_style="green", box=box.ROUNDED
@@ -2751,6 +3045,13 @@ def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=N
     name = Prompt.ask("Tunnel Instance Name", default=f"win-{eng[:2]}{secrets.randbelow(90)+10}").strip()
     name = "".join(c for c in name if c.isalnum() or c in "-_") or "winner"
     _protect_instance_name(name)
+    if eng in ADDED_ENGINES:
+        cfg = wizard_added_engine(eng, name, iran_ip, foreign_ip, direction=best["direction"], preferred=tr)
+        link = encode_link("kerov", cfg)
+        service = deploy_added_engine(cfg, "iran", link)
+        console.print(Text(f"Started {service}", style=OK_C))
+        print_copyable_link("WINNER AUTO-SYNC LINK READY", link, "Apply this link on Foreign via Create Tunnel.")
+        return
     ports = ask_port_mappings()
 
     if eng == "brokennode":
@@ -2876,13 +3177,20 @@ def _managed_bench_path(tunnel, cfg):
         return "127.0.0.1", echo_port, (
             lambda timeout: _socks_bench_connection(proxy_port, "127.0.0.1", echo_port, timeout)
         )
+    if engine == "ctunnel" and cfg["transport"] not in CTUNNEL_L4:
+        peer = "foreign" if role == "iran" else "iran"
+        address = _added_ipv4(cfg.get(f"ct_{peer}_tun") or f"10.77.{int(cfg['ct_index'])}.{1 if peer == 'iran' else 2}")
+        echo_port = _added_port({"port": IntPrompt.ask("Unused peer echo TCP port", default=49500)}, "port")
+        return address, echo_port, lambda timeout: socket.create_connection((address, echo_port), timeout=timeout)
     if cfg["transport"] == "tun":
         side = "iran" if (role == "server") == (cfg["direction"] == "reverse") else "foreign"
         peer = "foreign" if side == "iran" else "iran"
         address = str(ipaddress.IPv4Interface(cfg[f"{peer}_tun_cidr"]).ip)
         echo_port = _added_port({"port": IntPrompt.ask("Unused peer echo TCP port", default=49500)}, "port")
         return address, echo_port, lambda timeout: socket.create_connection((address, echo_port), timeout=timeout)
-    if role != "server":
+    if engine == "ctunnel" and role != "iran":
+        raise ValueError("Start the C-Tunnel Layer 4 benchmark on Iran, where the ports are forwarded.")
+    if engine != "ctunnel" and role != "server":
         raise ValueError("Start the benchmark from the Leech listener with the TCP port mapping.")
     _validate_cfg(cfg)
     mappings = cfg.get("ports", [])
@@ -2908,8 +3216,8 @@ def _serve_managed_benchmark(cfg):
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((str(address), port))
         server.listen(8)
-        console.print(f"[green]Peer echo ready on {address}:{port}.[/] Waiting up to 3 minutes.")
-        deadline = time.monotonic() + 180
+        console.print(f"[green]Peer echo ready on {address}:{port}.[/] Waiting up to 5 minutes.")
+        deadline = time.monotonic() + BENCH_PEER_WAIT
         while (remaining := deadline - time.monotonic()) > 0:
             server.settimeout(remaining)
             try:
@@ -2922,10 +3230,325 @@ def _serve_managed_benchmark(cfg):
         console.print("[yellow]Peer echo session expired.[/]")
 
 
+ADDED_BENCH_CASES = [
+    ("leech", transport, direction)
+    for direction in ("reverse", "direct")
+    for transport in (
+        *(value for value in LEECH_TRANSPORTS if value != "tun"),
+        *(f"tun/{encap}" for encap in LEECH_TUN_ENCAPS if encap != "ipx"),
+        *(f"tun/ipx/{profile}" for profile in LEECH_IPX_PROFILES),
+    )
+] + [("qs", transport, "direct") for transport in QS_TRANSPORTS] + [("icmp", "icmp", "direct")]
+
+MATRIX_BENCH_CASES = BASE_BENCH_CASES + ADDED_BENCH_CASES
+
+BENCH_SETUP_ERRORS = (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.CalledProcessError)
+
+
+def _temporary_bench_config(case, iran_ip, foreign_ip, tport, fport, secret, options):
+    if case not in ADDED_BENCH_CASES:
+        raise ValueError("Unsupported temporary test case.")
+    engine, transport, direction = case
+    tport = _added_port({"port": tport}, "port")
+    fport = _added_port({"port": fport}, "port")
+    if not (49200 <= tport < 49500 and 49500 <= fport < 49800 and fport - tport == 300):
+        raise ValueError("The temporary benchmark ports are outside the session range.")
+    digest = hmac.digest(bytes.fromhex(secret), f"{engine}/{transport}/{direction}/{tport}".encode(), "sha256")
+    cfg = dict(name=f"bench-{digest.hex()[:16]}", engine=engine, transport=transport,
+               direction=direction, iran_ip=_added_ipv4(iran_ip), foreign_ip=_added_ipv4(foreign_ip),
+               tunnel_port=tport)
+    probe_side = "iran"
+    if engine == "leech":
+        probe_side = "iran" if direction == "reverse" else "foreign"
+        cfg.update(token=digest.hex()[:48], psk=base64.b64encode(digest).decode("ascii"),
+                   license_key=options.get("license_key", LEECH_LICENSE),
+                   ports=[{"bind": fport, "target": fport, "proto": "tcp"}])
+        if transport.startswith("tun/"):
+            _, encap, *profile = transport.split("/")
+            network = f"10.243.{digest[16]}.{digest[17] & 252}"
+            prefix, last = network.rsplit(".", 1)
+            cfg.update(transport="tun", encapsulation=encap, ipx_profile=profile[0] if profile else "tcp",
+                       health_port=tport + 1000, iran_tun_cidr=f"{prefix}.{int(last) + 1}/30",
+                       foreign_tun_cidr=f"{prefix}.{int(last) + 2}/30", ports=[])
+    elif engine == "qs":
+        cfg.update(socks_port=fport + 1000, download_src_port=tport + 1000, download_port=tport + 1000,
+                   upload_proxy=options.get("upload_proxy", "127.0.0.1:10808"),
+                   upload_source=options.get("upload_source") or iran_ip, psk=digest.hex())
+        if transport.endswith("+spoof"):
+            cfg["spoof_ip"] = options.get("qs_spoof_ip") or foreign_ip
+    else:
+        cfg.update(socks_port=fport + 1000, api_port=tport + 1000,
+                   key=10000000 + int.from_bytes(digest[:4], "big") % 90000000, psk=digest.hex()[:32])
+    return cfg, probe_side, digest
+
+
+@contextmanager
+def _temporary_bench_endpoint(cfg, side, probe_side, fport, key, tmpdir):
+    with tempfile.TemporaryDirectory(prefix="endpoint-", dir=tmpdir) as directory:
+        service = deploy_added_engine(cfg, side, "", benchmark_directory=Path(directory))
+        try:
+            if side == probe_side:
+                yield
+                return
+            address = "127.0.0.1"
+            if cfg["transport"] == "tun":
+                address = str(ipaddress.IPv4Interface(cfg[f"{side}_tun_cidr"]).ip)
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                deadline = time.monotonic() + 3
+                while True:
+                    try:
+                        listener.bind((address, fport))
+                        break
+                    except OSError as error:
+                        if error.errno != errno.EADDRNOTAVAIL or time.monotonic() >= deadline:
+                            raise
+                        time.sleep(0.15)
+                listener.listen(8)
+                listener.settimeout(0.25)
+                stop = threading.Event()
+
+                def echo():
+                    while not stop.is_set():
+                        try:
+                            conn, _ = listener.accept()
+                        except socket.timeout:
+                            continue
+                        except OSError:
+                            return
+                        _handle_bench_echo(conn, key)
+
+                worker = threading.Thread(target=echo, daemon=True)
+                worker.start()
+                try:
+                    yield
+                finally:
+                    stop.set()
+                    worker.join(timeout=0.4)
+        finally:
+            run_cmd(["systemctl", "stop", service])
+            (BENCH_RUNTIME_DIR / f"{service}.service").unlink(missing_ok=True)
+            run_cmd(["systemctl", "daemon-reload"])
+
+
+def _probe_temporary_bench(cfg, side, fport, key, progress):
+    address = "127.0.0.1"
+    if cfg["engine"] in ("qs", "icmp"):
+        def dial(timeout):
+            return _socks_bench_connection(cfg["socks_port"], address, fport, timeout)
+    else:
+        if cfg["transport"] == "tun":
+            peer = "foreign" if side == "iran" else "iran"
+            address = str(ipaddress.IPv4Interface(cfg[f"{peer}_tun_cidr"]).ip)
+
+        def dial(timeout):
+            return socket.create_connection((address, fport), timeout=timeout)
+
+    return _probe_local_port(fport, dial=dial, key=key, on_progress=progress)
+
+
+def _send_bench_message(conn, payload):
+    conn.sendall((json.dumps(payload) + "\n").encode())
+
+
+def _read_bench_line(conn, limit=4096):
+    line = bytearray()
+    while len(line) < limit:
+        char = _bench_read_exact(conn, 1)
+        if char == b"\n":
+            return line.decode().strip()
+        line.extend(char)
+    raise ValueError("Invalid benchmark peer response.")
+
+
+def _read_bench_message(conn, *, limit=4096):
+    message = json.loads(_read_bench_line(conn, limit=limit))
+    if not isinstance(message, dict):
+        raise ValueError("Invalid benchmark peer response.")
+    return message
+
+
+def _run_added_bench(conn, case, iran_ip, foreign_ip, tport, fport, secret, options, tmpdir, board, idx):
+    cfg, probe_side, key = _temporary_bench_config(case, iran_ip, foreign_ip, tport, fport, secret, options)
+    peer_options = {key: value for key, value in options.items() if key != "license_key"}
+    _send_bench_message(conn, {"action": "start-temporary", "case": case, "foreign_ip": foreign_ip,
+                               "tport": tport, "fport": fport, "options": peer_options})
+    with ExitStack() as local:
+        setup_error = ""
+        try:
+            local.enter_context(_temporary_bench_endpoint(cfg, "iran", probe_side, fport, key, tmpdir))
+        except BENCH_SETUP_ERRORS as error:
+            setup_error = str(error).splitlines()[0][:240]
+        ready = _read_bench_message(conn)
+        if not ready.get("ready"):
+            return None, "SKIPPED", str(ready.get("error", "Peer setup failed."))[:240]
+        try:
+            if setup_error:
+                return None, "START FAIL", setup_error
+            board.mark(idx, "WARMUP")
+            time.sleep(2.2)
+            if probe_side == "iran":
+                metrics = _probe_temporary_bench(cfg, "iran", fport, key, lambda *event: board.probe(idx, *event))
+            else:
+                _send_bench_message(conn, {"action": "probe-temporary"})
+                while True:
+                    message = _read_bench_message(conn)
+                    if "result" in message:
+                        metrics = message["result"]
+                        break
+                    phase, echoes = message.get("phase"), message.get("echoes")
+                    if phase not in ("ECHO", "DOWNLOAD", "UPLOAD") or type(echoes) is not int or not 0 <= echoes <= 5:
+                        raise ValueError("Invalid benchmark progress from peer.")
+                    down = message.get("down")
+                    if down is not None and (type(down) not in (int, float) or not 0 <= down <= 1000000):
+                        raise ValueError("Invalid download sample from peer.")
+                    board.probe(idx, phase, echoes, down)
+                fields = ("mbps", "ul_mbps", "rtt", "jitter", "loss")
+                if metrics is not None and (not isinstance(metrics, dict) or set(metrics) != set(fields)
+                        or any(type(v) not in (int, float) or not 0 <= v <= 1000000 for v in metrics.values())
+                        or metrics["loss"] > 100):
+                    raise ValueError("Invalid benchmark result from peer.")
+            return metrics, _bench_outcome(metrics) if metrics else "NO ECHO", ""
+        except BENCH_SETUP_ERRORS as error:
+            return None, "START FAIL", str(error).splitlines()[0][:240]
+        finally:
+            _send_bench_message(conn, {"action": "stop-temporary"})
+            _read_bench_message(conn)
+
+
+BENCH_STATUS_COLORS = {
+    "QUEUED": MUTED, "SETUP": ACCENT, "WARMUP": ACCENT, "ECHO": WARN_C,
+    "DOWNLOAD": OK_C, "UPLOAD": OK_C, "OK": OK_C, "UNSTABLE": WARN_C,
+    "NO ECHO": BAD_C, "START FAIL": BAD_C, "SKIPPED": MUTED, "ESTIMATE": WARN_C,
+}
+
+
+def _bench_status(label):
+    return Text(f"● {label}", style=f"bold {BENCH_STATUS_COLORS.get(label, MUTED)}")
+
+
+def _bench_rate(rate):
+    return "—" if rate is None else f"{rate:.1f}"
+
+
+def _bench_outcome(metrics):
+    return "OK" if metrics["loss"] == 0 and metrics["mbps"] > 0 and metrics["ul_mbps"] > 0 else "UNSTABLE"
+
+
+class BenchmarkBoard:
+    def __init__(self, title, cases):
+        self.title = title
+        self.cases = cases
+        self.rows = [{"status": "QUEUED"} for _ in cases]
+        self.current = 0
+        self.completed = 0
+        self.live = Live(console=console, auto_refresh=False, transient=True, redirect_stdout=False, redirect_stderr=False)
+
+    def __enter__(self):
+        self.live.update(self.render())
+        self.live.start(refresh=True)
+        return self
+
+    def __exit__(self, *exc):
+        self.live.stop()
+
+    def mark(self, index, status, **data):
+        self.current = index
+        self.rows[index].update(status=status, **data)
+        if status in ("OK", "UNSTABLE", "NO ECHO", "START FAIL", "SKIPPED", "ESTIMATE"):
+            self.completed = index + 1
+        self.live.update(self.render(), refresh=True)
+
+    def probe(self, index, phase, echoes, down=None):
+        data = {"echo": f"{echoes}/5"}
+        if down is not None:
+            data["mbps"] = down
+        self.mark(index, phase, **data)
+
+    def render(self):
+        total = len(self.rows)
+        limit = min(total, max(1, console.height - 12), 8)
+        start = max(0, min(self.current - limit // 2, total - limit))
+        end = min(total, start + limit)
+        skinny = console.width < 64
+        table = Table(box=box.SIMPLE_HEAD, expand=True, header_style=f"bold {CREAM}", border_style=DIVIDER, padding=(0, 1))
+        table.add_column("#", no_wrap=True, justify="right", style=MUTED)
+        table.add_column("Engine / Transport", ratio=3)
+        if not skinny:
+            table.add_column("Mode", no_wrap=True, style=MUTED)
+        table.add_column("Status", no_wrap=True)
+        table.add_column("Echo", justify="right", no_wrap=True, style=MUTED)
+        table.add_column("↓ / ↑ Mbps", justify="right", no_wrap=True)
+        for index in range(start, end):
+            engine, transport, direction = self.cases[index]
+            data = self.rows[index]
+            name = Text(f"{engine} / {transport}", style=CREAM)
+            if skinny:
+                name.append(f" · {direction}", style=MUTED)
+            cells = [str(index + 1), name]
+            if not skinny:
+                cells.append(direction.upper())
+            cells.extend((_bench_status(data["status"]), data.get("echo", "—"),
+                          f"{_bench_rate(data.get('mbps'))} / {_bench_rate(data.get('ul_mbps'))}"))
+            table.add_row(*cells)
+        progress = Text(f"  {self.completed}/{total} complete", style=CREAM)
+        if total != limit:
+            progress.append(f"  ·  showing {start + 1}–{end}", style=MUTED)
+        return Group(Rule(_section_title(self.title), style=DIVIDER, align="left"), progress, table)
+
+
+def _render_bench_results(results, title="BENCHMARK RESULTS"):
+    wide = console.width >= 104
+    max_speed = max((row["mbps"] for row in results), default=1) or 1
+    table = Table(title=_section_title(title), box=box.SIMPLE_HEAD, expand=True, border_style=DIVIDER,
+                  header_style=f"bold {CREAM}", padding=(0, 1))
+    table.add_column("#", justify="right", no_wrap=True, style=MUTED)
+    table.add_column("Engine / Transport", min_width=18 if wide else 12, ratio=2, overflow="fold")
+    if wide:
+        table.add_column("Mode", style=MUTED)
+        table.add_column("Status")
+        table.add_column("↓ / ↑ Mbps", justify="right")
+        table.add_column("Speed")
+        table.add_column("RTT / Jitter", justify="right")
+        table.add_column("Loss", justify="right")
+        table.add_column("Grade", justify="right")
+    else:
+        table.add_column("Measurement", ratio=3)
+    for index, row in enumerate(results, 1):
+        name = Text(f"{row['engine']} / {row['transport']}", style=CREAM)
+        status = row["display_status"]
+        grade = "—" if status in ("SKIPPED", "START FAIL") else _grade_badge(row["mbps"], row["rtt"], row["loss"])
+        rate = f"{_bench_rate(row['mbps'])} / {_bench_rate(row.get('ul_mbps', 0))}"
+        failed = row["loss"] == 100
+        if failed:
+            rate = "—"
+        timing = "—" if failed else f"{row['rtt']:.1f} / {row['jitter']:.1f} ms"
+        bar = _speed_bar(row["mbps"], max_speed, 8)
+        loss = "—" if status in ("SKIPPED", "START FAIL") else f"{row['loss']:.0f}%"
+        if wide:
+            table.add_row(str(index), name, row["direction"].upper(), _bench_status(status), rate, bar, timing, loss, grade)
+        else:
+            name.append(f"\n{row['direction'].upper()}", style=MUTED)
+            measurement = _bench_status(status)
+            stats = f"↓/↑ {rate} Mbps · RTT/jitter {timing} · Loss {loss}" if not failed else f"Loss {loss}"
+            measurement.append(f"\n{stats}\n", style=CREAM)
+            measurement.append_text(Text.from_markup(f"{bar}  {grade}"))
+            table.add_row(str(index), name, measurement)
+    console.print(table)
+    if any(r["display_status"] == "ESTIMATE" for r in results):
+        console.print(Text("ESTIMATE  Kerov-UDP uses preset values in the current matrix.", style=WARN_C))
+    reasons = {}
+    for result in results:
+        if reason := result.get("reason"):
+            reasons[reason] = reasons.get(reason, 0) + 1
+    for reason, count in reasons.items():
+        console.print(Text(f"{count} case(s) · {reason}", style=MUTED))
+
+
 def _benchmark_managed_tunnel():
-    tunnels = [item for item in list_tunnels() if item["engine"] in ADDED_ENGINES and item["status"] == "active"]
+    tunnels = [item for item in list_tunnels() if item["engine"] in (*ADDED_ENGINES, "ctunnel") and item["status"] == "active"]
     if not tunnels:
-        console.print("[yellow]Start a Leech, QS or ICMP tunnel first.[/]")
+        console.print("[yellow]Start a Leech, QS, ICMP or C-Tunnel instance first.[/]")
         pause()
         return
     for number, tunnel in enumerate(tunnels, 1):
@@ -2944,19 +3567,20 @@ def _benchmark_managed_tunnel():
                             "On the peer select Smart Benchmark → Peer Agent and paste this private link.")
         if not Confirm.ask("Peer echo ready. Start the measurements?", default=False):
             return
-        with console.status(f"[cyan]Measuring {tunnel['name']}...[/]"):
-            metrics = _probe_local_port(port, dial=dial, key=bytes.fromhex(key))
+        case = (tunnel["engine"], tunnel["transport"], tunnel["direction"])
+        with BenchmarkBoard(f"MANAGED TEST · {tunnel['name']}", [case]) as board:
+            metrics = _probe_local_port(port, dial=dial, key=bytes.fromhex(key),
+                                        on_progress=lambda *event: board.probe(0, *event))
+            board.mark(0, _bench_outcome(metrics) if metrics else "NO ECHO", **(metrics or {}))
         if metrics is None:
             console.print("[red]No authenticated echo response. Check the mapping or SOCKS5 path and peer listener.[/]")
         else:
-            speed, upload = metrics["mbps"], metrics["ul_mbps"]
-            grade = _grade_badge(speed, metrics["rtt"], metrics["loss"])
-            console.print(Panel(
-                f"↓ {speed:.2f} Mbps   ↑ {upload:.2f} Mbps   {grade}\n"
-                f"RTT {metrics['rtt']:.2f} ms  ·  Jitter {metrics['jitter']:.2f} ms  ·  Probe loss {metrics['loss']:.0f}%",
-                title=f"{tunnel['engine']} / {tunnel['transport']}", border_style="cyan",
-            ))
-            iran = (tunnel["role"] == "server") == (cfg["direction"] == "reverse")
+            _render_bench_results([{
+                "engine": tunnel["engine"], "transport": tunnel["transport"], "direction": tunnel["direction"],
+                "display_status": _bench_outcome(metrics), **metrics,
+            }], title="MANAGED TUNNEL RESULT")
+            iran = (tunnel["role"] == "iran" if tunnel["engine"] == "ctunnel"
+                    else (tunnel["role"] == "server") == (cfg["direction"] == "reverse"))
             peer = cfg.get("foreign_ip" if iran else "iran_ip")
             _save_bench_history({
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -2969,16 +3593,69 @@ def _benchmark_managed_tunnel():
     pause()
 
 
+def _run_ctunnel_benchmark(conn, iran_ip):
+    if not _ctunnel_ready():
+        return "C-Tunnel core missing on Iran. Run the Kerov installer first."
+    listener = subprocess.Popen([BINS["ctunnel"], "conntest-server", iran_ip],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.monotonic() + 20
+        output = bytearray()
+        match = None
+        while not match and time.monotonic() < deadline:
+            if not select.select([listener.stdout], [], [], max(0, deadline - time.monotonic()))[0]:
+                break
+            data = os.read(listener.stdout.fileno(), 4096)
+            if not data:
+                break
+            output.extend(data)
+            match = re.search(rb"ctunnel-test://[A-Za-z0-9_-]+(?=['\s])", output)
+        if not match:
+            detail = re.sub(r"ctunnel-test://[A-Za-z0-9_-]*", "<test link>", output.decode(errors="replace"))
+            return "C-Tunnel responder did not start. " + detail.strip()[-320:]
+        _send_bench_message(conn, {"action": "benchmark-ctunnel", "link": match.group().decode()})
+        conn.settimeout(570)
+        try:
+            result = _read_bench_message(conn, limit=131072)
+        finally:
+            conn.settimeout(BENCH_CONTROL_TIMEOUT)
+        return str(result.get("report", "No C-Tunnel report was returned."))[:48000]
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+        try:
+            listener.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            listener.kill()
+            listener.wait()
+        listener.stdout.close()
+
+
+def _run_ctunnel_peer_test(link):
+    if not _ctunnel_ready():
+        return "C-Tunnel core missing on Foreign. Run the Kerov installer first."
+    if not isinstance(link, str) or not re.fullmatch(r"ctunnel-test://[A-Za-z0-9_-]{1,2048}", link):
+        return "Invalid C-Tunnel benchmark link."
+    try:
+        result = subprocess.run([BINS["ctunnel"], "conntest", link], capture_output=True, text=True, timeout=515)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"C-Tunnel peer test could not finish: {type(error).__name__}."
+    if result.returncode:
+        return "C-Tunnel peer test failed. " + result.stderr.strip()[:240]
+    return result.stdout.strip()[:48000]
+
+
 def benchmark_menu():
     render_header()
-    console.print(Panel(
-        "[bold cyan][1] Iran Server (Coordinator)[/]   [dim]Generates [cyan]kerov-test://[/] link & measures DL/UL, RTT, Jitter, Grade[/]\n"
-        "[bold green][2] Peer Agent[/]                  [dim]Paste a [cyan]kerov-test://[/] link[/]\n"
-        "[bold yellow][3] Benchmark History[/]           [dim]View past rankings and measurements[/]\n"
-        "[bold cyan][4] Benchmark Managed Tunnel[/]      [dim]Leech, QS and ICMP over a running tunnel[/]\n"
-        "[dim][0] Back to Main Menu[/]",
-        title="[bold magenta]SMART BENCHMARK PRO — SUPPORTED BENCHMARK TRANSPORTS[/]", border_style="magenta", box=box.ROUNDED
-    ))
+    console.print(Rule(_section_title("SMART BENCHMARK"), style=DIVIDER, align="left"))
+    for option in (
+        ("1", "Iran Server (Coordinator)", "Create a test link and compare transports"),
+        ("2", "Peer Agent", "Join with a kerov-test:// link"),
+        ("3", "Benchmark History", "Past rankings and measurements"),
+        ("4", "Benchmark Managed Tunnel", "Test a running Leech, QS, ICMP or C-Tunnel instance"),
+        ("0", "Back to Main Menu", ""),
+    ):
+        console.print(_menu_cell(*option))
     c = Prompt.ask("[bold cyan]kerov > Select[/]", choices=["0", "1", "2", "3", "4"], default="1")
     if c == "0":
         return
@@ -2993,15 +3670,18 @@ def benchmark_menu():
         iran_ip = Prompt.ask("Iran Server Public IP", default=get_public_ip())
         ctrl_port = IntPrompt.ask("Benchmark Control Port (TCP)", default=49150)
 
-        console.print(Panel(
-            "[cyan][1] Quick Mode[/]    [dim]Top 8 fastest transports (~25 sec)[/]\n"
-            f"[cyan][2] Full Mode[/]     [dim]All {len(BASE_BENCH_CASES)} transports across all cores[/]\n"
-            "[cyan][3] Reverse Only[/]  [dim]BrokenNode + DaggerConnect + Backhaul[/]\n"
-            "[cyan][4] Direct Only[/]   [dim]paqet-plus + Kerov-UDP[/]\n"
-            "[cyan][5] Custom Cores[/]  [dim]Pick specific cores to test[/]",
-            title="[bold cyan]SELECT BENCHMARK PROFILE[/]", border_style="cyan", box=box.ROUNDED
-        ))
-        mode_c = Prompt.ask("Profile", choices=["1", "2", "3", "4", "5"], default="2")
+        console.print(Rule(_section_title("BENCHMARK PROFILE"), style=DIVIDER, align="left"))
+        for option in (
+            ("1", "Quick Mode", "8 selected transports"),
+            ("2", "Full Mode", f"{len(MATRIX_BENCH_CASES)} matrix cases + C-Tunnel native tests"),
+            ("3", "Reverse Only", "All Reverse cases"),
+            ("4", "Direct Only", "All Direct cases"),
+            ("5", "Custom Cores", "Choose which cores to test"),
+            ("6", "C-Tunnel Native", "Direct and Reverse suite"),
+        ):
+            console.print(_menu_cell(*option))
+        mode_c = Prompt.ask("Profile", choices=["1", "2", "3", "4", "5", "6"], default="2")
+        run_ctunnel_bench = mode_c in ("2", "6")
         if mode_c == "1":
             mode_name = "quick"
             bench_cases = [
@@ -3012,18 +3692,33 @@ def benchmark_menu():
             ]
         elif mode_c == "3":
             mode_name = "reverse"
-            bench_cases = [x for x in BASE_BENCH_CASES if x[2] == "reverse"]
+            bench_cases = [x for x in MATRIX_BENCH_CASES if x[2] == "reverse"]
         elif mode_c == "4":
             mode_name = "direct"
-            bench_cases = [x for x in BASE_BENCH_CASES if x[2] == "direct"]
+            bench_cases = [x for x in MATRIX_BENCH_CASES if x[2] == "direct"]
         elif mode_c == "5":
             mode_name = "custom"
-            picks = Prompt.ask("Enter cores (comma-separated: brokennode,dagger,backhaul,paqet,kerov-udp)", default="backhaul,brokennode")
+            picks = Prompt.ask("Enter cores (brokennode,dagger,backhaul,paqet,kerov-udp,leech,qs,icmp,ctunnel)", default="backhaul,brokennode")
             wanted = {x.strip().lower() for x in picks.split(",")}
-            bench_cases = [x for x in BASE_BENCH_CASES if x[0] in wanted] or list(BASE_BENCH_CASES)
+            run_ctunnel_bench = "ctunnel" in wanted
+            bench_cases = [x for x in MATRIX_BENCH_CASES if x[0] in wanted]
+            if not bench_cases and not run_ctunnel_bench:
+                bench_cases = list(MATRIX_BENCH_CASES)
+        elif mode_c == "6":
+            mode_name = "ctunnel"
+            bench_cases = []
         else:
             mode_name = "full"
-            bench_cases = list(BASE_BENCH_CASES)
+            bench_cases = list(MATRIX_BENCH_CASES)
+
+        test_options = {}
+        selected_engines = {engine for engine, _, _ in bench_cases}
+        if "leech" in selected_engines:
+            test_options["license_key"] = Prompt.ask("Leech license key", password=True, default=LEECH_LICENSE)
+        if "qs" in selected_engines:
+            test_options["upload_proxy"] = Prompt.ask("QS upload SOCKS5 on Iran", default="127.0.0.1:10808")
+            test_options["upload_source"] = Prompt.ask("QS SOCKS5 egress IPv4 as seen by Foreign", default=iran_ip)
+            test_options["qs_spoof_ip"] = Prompt.ask("QS alternate source IPv4 assigned to Foreign (blank = Foreign IP)", default="")
 
         spoof_opts = None
         if mode_c in ("2", "3", "5") and Confirm.ask("Include BrokenNode IP-Spoofing (spoof) in benchmark?", default=False):
@@ -3039,6 +3734,12 @@ def benchmark_menu():
 
         secret = secrets.token_hex(32)
         test_payload = {"iran_ip": iran_ip, "ctrl_port": ctrl_port, "secret": secret}
+        if selected_engines & set(ADDED_ENGINES):
+            test_payload["temporary_matrix"] = True
+        if run_ctunnel_bench:
+            test_payload["ctunnel_matrix"] = True
+        if "leech" in selected_engines:
+            test_payload["leech"] = True
         if spoof_opts:
             test_payload["spoof"] = spoof_opts
         test_link = encode_link("kerov-test", test_payload)
@@ -3053,7 +3754,7 @@ def benchmark_menu():
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind(("0.0.0.0", ctrl_port))
         srv.listen(1)
-        srv.settimeout(180)
+        srv.settimeout(BENCH_PEER_WAIT)
         try:
             conn, addr = srv.accept()
         except socket.timeout:
@@ -3074,59 +3775,99 @@ def benchmark_menu():
         except socket.timeout:
             pass
         expected = hmac.new(secret.encode(), b"kerov-bench", "sha256").hexdigest()
-        if not hmac.compare_digest(auth.decode(errors="ignore").strip(), f"AUTH {expected}"):
+        auth_line = auth.decode(errors="ignore").strip()
+        auth_expected = f"AUTH {expected}"
+        if test_payload.get("temporary_matrix") and hmac.compare_digest(auth_line, auth_expected):
+            console.print("[red]Update the Foreign server to Kerov v2.3.6 or later for this matrix.[/]")
+            conn.close()
+            pause()
+            return
+        if test_payload.get("temporary_matrix"):
+            auth_expected += " TEMP1"
+        if test_payload.get("ctunnel_matrix"):
+            if hmac.compare_digest(auth_line, auth_expected):
+                console.print("[red]Update the Foreign server to Kerov v2.3.10 for C-Tunnel testing.[/]")
+                conn.close()
+                pause()
+                return
+            auth_expected += " CT1"
+        if not hmac.compare_digest(auth_line, auth_expected):
             console.print(f"[red]✗ Rejected unauthenticated connection from {addr[0]}.[/]")
             conn.close()
             pause()
             return
-        conn.settimeout(120)
+        conn.settimeout(BENCH_CONTROL_TIMEOUT)
         foreign_ip = addr[0]
         console.print(f"[bold green]✔ Foreign server connected from {foreign_ip}! Starting {mode_name.upper()} matrix ({len(bench_cases)} tests)...[/]\n")
 
         results = []
+        ctunnel_report = ""
         tmpdir = Path(tempfile.mkdtemp(prefix="kerov-bench-"))
         try:
-            with Progress(SpinnerColumn(), TextColumn("[cyan]{task.description}"), BarColumn(), TextColumn("{task.completed}/{task.total}"), console=console) as prog:
-                task = prog.add_task("Benchmarking...", total=len(bench_cases))
-                for idx, (eng, tr, direction) in enumerate(bench_cases):
-                    tport = 49200 + idx
-                    fport = 49500 + idx
-                    prog.update(task, description=f"Testing {eng} / {tr} ({direction})...")
+            if bench_cases:
+                with BenchmarkBoard(f"CONNECTION TEST · {mode_name.upper()}", bench_cases) as board:
+                    for idx, (eng, tr, direction) in enumerate(bench_cases):
+                        tport = 49200 + idx
+                        fport = 49500 + idx
+                        board.mark(idx, "SETUP")
 
-                    cmd = {"action": "start", "engine": eng, "transport": tr, "tport": tport, "fport": fport}
-                    conn.sendall((json.dumps(cmd) + "\n").encode())
-                    resp = conn.recv(1024).decode().strip()
-
-                    proc = _spawn_bench_proc(eng, tr, "iran", iran_ip, foreign_ip, tport, fport, secret, tmpdir, spoof_opts=spoof_opts)
-                    if proc and "OK" in resp:
-                        time.sleep(3.0 if (tr.startswith("spoof/") or tr.startswith("tun/")) else 2.2)
-                        if eng == "kerov-udp":
-                            metrics = {"rtt": 35.0, "jitter": 2.0, "loss": 0.0, "mbps": 120.0, "ul_mbps": 110.0} if proc.poll() is None else None
+                        note = ""
+                        if eng in ADDED_ENGINES:
+                            metrics, display_status, note = _run_added_bench(
+                                conn, (eng, tr, direction), iran_ip, foreign_ip, tport, fport, secret,
+                                test_options, tmpdir, board, idx,
+                            )
                         else:
-                            metrics = _probe_local_port(fport)
+                            cmd = {"action": "start", "engine": eng, "transport": tr, "tport": tport, "fport": fport}
+                            conn.sendall((json.dumps(cmd) + "\n").encode())
+                            resp = _read_bench_line(conn, limit=128)
+
+                            display_status = "SKIPPED" if resp == "SKIP" else "START FAIL"
+                            metrics = None
+                            proc = None
+                            try:
+                                if resp == "OK":
+                                    proc = _spawn_bench_proc(eng, tr, "iran", iran_ip, foreign_ip, tport, fport,
+                                                             secret, tmpdir, spoof_opts=spoof_opts)
+                                if proc:
+                                    board.mark(idx, "WARMUP")
+                                    time.sleep(3.0 if (tr.startswith("spoof/") or tr.startswith("tun/")) else 2.2)
+                                    if eng == "kerov-udp":
+                                        metrics = {"rtt": 35.0, "jitter": 2.0, "loss": 0.0, "mbps": 120.0, "ul_mbps": 110.0} if proc.poll() is None else None
+                                        display_status = "ESTIMATE" if metrics else "START FAIL"
+                                    else:
+                                        metrics = _probe_local_port(fport, on_progress=lambda *event: board.probe(idx, *event))
+                                        display_status = _bench_outcome(metrics) if metrics else "NO ECHO"
+                            except BENCH_SETUP_ERRORS as error:
+                                note = str(error).splitlines()[0][:240]
+                            finally:
+                                if proc:
+                                    proc.terminate()
+                                    try:
+                                        proc.wait(timeout=3)
+                                    except subprocess.TimeoutExpired:
+                                        proc.kill()
+                                if tr.startswith("spoof/"):
+                                    run_cmd("ip link del kspbench0 2>/dev/null || true; ip link del bhbench0 2>/dev/null || true; ip link del dcbench0 2>/dev/null || true")
+                                elif tr.startswith("tun/"):
+                                    run_cmd("ip link del bhbench0 2>/dev/null || true; ip link del dcbench0 2>/dev/null || true")
+                                _send_bench_message(conn, {"action": "stop"})
+                                _read_bench_line(conn, limit=128)
+                        board.mark(idx, display_status, **(metrics or {}))
                         if metrics:
                             avg_spd = (metrics["mbps"] + metrics.get("ul_mbps", 0.0)) / 2.0
                             score = (avg_spd * 2.0) - (metrics["rtt"] * 0.5) - (metrics["loss"] * 5.0)
-                            results.append({"engine": eng, "transport": tr, "direction": direction, **metrics, "score": score})
                         else:
-                            results.append({"engine": eng, "transport": tr, "direction": direction, "rtt": 9999, "jitter": 0, "loss": 100, "mbps": 0, "ul_mbps": 0, "score": -9999})
-                    else:
-                        results.append({"engine": eng, "transport": tr, "direction": direction, "rtt": 9999, "jitter": 0, "loss": 100, "mbps": 0, "ul_mbps": 0, "score": -9999})
+                            metrics = {"rtt": 9999, "jitter": 0, "loss": 100, "mbps": 0, "ul_mbps": 0}
+                            score = -9999
+                        results.append({"engine": eng, "transport": tr, "direction": direction, **metrics,
+                                        "score": score, "display_status": display_status, "reason": note})
 
-                    if proc:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                    if tr.startswith("spoof/"):
-                        run_cmd("ip link del kspbench0 2>/dev/null || true; ip link del bhbench0 2>/dev/null || true; ip link del dcbench0 2>/dev/null || true")
-                    elif tr.startswith("tun/"):
-                        run_cmd("ip link del bhbench0 2>/dev/null || true; ip link del dcbench0 2>/dev/null || true")
-                    conn.sendall((json.dumps({"action": "stop"}) + "\n").encode())
-                    conn.recv(1024)
-                    prog.advance(task)
 
+            if run_ctunnel_bench:
+                console.print(Rule(_section_title("C-TUNNEL / NATIVE BENCHMARK"), style=DIVIDER, align="left"))
+                with console.status("Testing the C-Tunnel Direct and Reverse catalog. Allow up to 9 minutes."):
+                    ctunnel_report = _run_ctunnel_benchmark(conn, iran_ip)
             conn.sendall((json.dumps({"action": "done"}) + "\n").encode())
         except Exception as e:
             console.print(f"\n[yellow]! Benchmark interrupted ({e}). Showing results collected so far...[/]\n")
@@ -3138,36 +3879,11 @@ def benchmark_menu():
             shutil.rmtree(tmpdir, ignore_errors=True)
 
         results.sort(key=lambda x: x["score"], reverse=True)
-        max_spd = max((r["mbps"] for r in results), default=100.0) or 100.0
-
-        rtbl = Table(
-            title="[bold white on green]  SMART BENCHMARK PRO — RANKING (BEST TO WORST)  [/]",
-            box=box.HEAVY_HEAD, border_style="bold green", header_style="bold white on dark_green",
-            expand=True, show_lines=True, padding=(0, 2), min_width=110,
-        )
-        rtbl.add_column("Rank", style="bold yellow", min_width=6, no_wrap=True, justify="center")
-        rtbl.add_column("Engine", style="bold magenta", min_width=12, no_wrap=True)
-        rtbl.add_column("Transport", style="bold cyan", min_width=16, no_wrap=True)
-        rtbl.add_column("DL / UL Speed", style="bold green", min_width=22, no_wrap=True)
-        rtbl.add_column("Speed Bar", min_width=22, no_wrap=True)
-        rtbl.add_column("RTT / Jitter", style="bold white", min_width=16, no_wrap=True)
-        rtbl.add_column("Loss", style="bold", min_width=6, no_wrap=True, justify="center")
-        rtbl.add_column("Grade", min_width=8, no_wrap=True, justify="center")
-        for rank, r in enumerate(results, 1):
-            grade = _grade_badge(r["mbps"], r["rtt"], r["loss"])
-            if r["mbps"] <= 0 and r["loss"] == 100:
-                rtbl.add_row(f"#{rank}", r["engine"], r["transport"], "[red]FAILED[/]", "[dim]" + "░" * 18 + "[/]", "-", "100%", grade)
-            else:
-                rtbl.add_row(
-                    f"#{rank}", r["engine"], r["transport"],
-                    f"↓{r['mbps']:.0f} / ↑{r.get('ul_mbps',0):.0f} Mbps",
-                    _speed_bar(r["mbps"], max_spd, 18),
-                    f"{r['rtt']:.0f}ms / {r['jitter']:.0f}ms",
-                    f"{r['loss']:.0f}%",
-                    grade,
-                )
-        console.print(rtbl)
-
+        if results:
+            _render_bench_results(results)
+        if ctunnel_report:
+            console.print(Rule(_section_title("C-TUNNEL / NATIVE RESULTS"), style=DIVIDER, align="left"))
+            console.print(Text(ctunnel_report))
         if results and results[0]["score"] > -9999:
             best = results[0]
             _save_bench_history({
@@ -3179,10 +3895,12 @@ def benchmark_menu():
             send_telegram_alert(
                 f"<b>Kerov Benchmark Complete</b> ({mode_name})\n"
                 f"Winner: <b>{best['engine'].upper()} / {best['transport']}</b>\n"
-                f"Speed: ↓{best['mbps']:.1f} / ↑{best.get('ul_mbps',0):.1f} Mbps | RTT: {best['rtt']:.1f} ms"
+                f"{'Estimated speed' if best['display_status'] == 'ESTIMATE' else 'Speed'}: "
+                f"↓{best['mbps']:.1f} / ↑{best.get('ul_mbps',0):.1f} Mbps | RTT: {best['rtt']:.1f} ms"
             )
-            console.print(Panel(
-                f"[bold green]★ WINNER:[/] [bold white]{best['engine'].upper()}[/] → [bold cyan]{best['transport']}[/] "
+            winner_title = "BENCHMARK WINNER · ESTIMATE" if best["display_status"] == "ESTIMATE" else "BENCHMARK WINNER"
+            console.print(_cli_panel(
+                f"[bold green]{winner_title}[/] [bold white]{best['engine'].upper()}[/] → [bold cyan]{best['transport']}[/] "
                 f"([yellow]{best['direction'].upper()}[/]) • [bold green]↓{best['mbps']:.1f} / ↑{best.get('ul_mbps',0):.1f} Mbps[/] • [white]{best['rtt']:.1f} ms RTT[/]\n\n"
                 "[bold yellow]Press [D] for 1-Click Deploy Winner on this server, or [Enter] to return.[/]",
                 border_style="green", box=box.ROUNDED
@@ -3220,30 +3938,79 @@ def benchmark_menu():
         ctrl_port = cfg["ctrl_port"]
         secret = cfg["secret"]
         spoof_opts = cfg.get("spoof")
+        local_license = Prompt.ask("Leech license key", password=True, default=LEECH_LICENSE) if cfg.get("leech") else LEECH_LICENSE
         foreign_ip = get_public_ip()
         console.print(f"[cyan]Connecting to Iran benchmark coordinator {iran_ip}:{ctrl_port}...[/]")
 
         tmpdir = Path(tempfile.mkdtemp(prefix="kerov-bench-agent-"))
         proc = None
         stop_ev = None
+        temporary = ExitStack()
+        test_endpoint = None
         try:
             with socket.create_connection((iran_ip, ctrl_port), timeout=15) as s:
-                s.sendall(("AUTH " + hmac.new(secret.encode(), b"kerov-bench", "sha256").hexdigest() + "\n").encode())
-                s.settimeout(120)
+                auth_line = "AUTH " + hmac.new(secret.encode(), b"kerov-bench", "sha256").hexdigest()
+                if cfg.get("temporary_matrix"):
+                    auth_line += " TEMP1"
+                if cfg.get("ctunnel_matrix"):
+                    auth_line += " CT1"
+                s.sendall((auth_line + "\n").encode())
+                s.settimeout(BENCH_CONTROL_TIMEOUT)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
                 console.print("[bold green]✔ Connected! Running synchronized tests (watch results on Iran)...[/]")
                 f = s.makefile("r")
                 for line in f:
                     msg = json.loads(line.strip())
                     act = msg["action"]
-                    if act == "start":
+                    if act == "benchmark-ctunnel":
+                        console.print(Text("C-Tunnel native test running…", style=ACCENT))
+                        report = _run_ctunnel_peer_test(msg["link"])
+                        _send_bench_message(s, {"report": report})
+                    elif act == "start-temporary":
+                        temporary.close()
+                        test_endpoint = None
+                        try:
+                            case, fport = tuple(msg["case"]), int(msg["fport"])
+                            config, probe_side, case_key = _temporary_bench_config(
+                                case, iran_ip, msg["foreign_ip"], msg["tport"], fport, secret,
+                                dict(msg["options"], license_key=local_license)
+                            )
+                            temporary.enter_context(_temporary_bench_endpoint(
+                                config, "foreign", probe_side, fport, case_key, tmpdir))
+                            test_endpoint = (config, probe_side, fport, case_key)
+                            _send_bench_message(s, {"ready": True})
+                            console.print(Text(f"● READY  {case[0]} / {case[1]}", style=OK_C))
+                        except BENCH_SETUP_ERRORS as error:
+                            temporary.close()
+                            _send_bench_message(s, {"ready": False, "error": str(error).splitlines()[0][:240]})
+                    elif act == "probe-temporary":
+                        if test_endpoint is None or test_endpoint[1] != "foreign":
+                            raise ValueError("No Foreign probe endpoint is ready.")
+                        config, _, fport, case_key = test_endpoint
+
+                        def progress(phase, echoes, down=None):
+                            _send_bench_message(s, {"phase": phase, "echoes": echoes, "down": down})
+
+                        measured = _probe_temporary_bench(config, "foreign", fport, case_key, progress)
+                        _send_bench_message(s, {"result": measured})
+                    elif act == "stop-temporary":
+                        temporary.close()
+                        test_endpoint = None
+                        _send_bench_message(s, {"stopped": True})
+                    elif act == "start":
                         stop_ev = threading.Event()
                         threading.Thread(target=_start_echo_sink, args=(msg["fport"], stop_ev), daemon=True).start()
-                        proc = _spawn_bench_proc(
-                            msg["engine"], msg["transport"], "foreign", iran_ip, foreign_ip,
-                            msg["tport"], msg["fport"], secret, tmpdir, spoof_opts=spoof_opts
-                        )
-                        console.print(f"  [dim]→ Running {msg['engine']} / {msg['transport']}...[/]")
+                        try:
+                            proc = _spawn_bench_proc(
+                                msg["engine"], msg["transport"], "foreign", iran_ip, foreign_ip,
+                                msg["tport"], msg["fport"], secret, tmpdir, spoof_opts=spoof_opts
+                            )
+                        except BENCH_SETUP_ERRORS as error:
+                            proc = None
+                            console.print(Text(str(error).splitlines()[0], style=WARN_C))
+                        state = Text("● READY" if proc else "○ SKIPPED", style=OK_C if proc else MUTED)
+                        state.append(f"  {msg['engine']} / {msg['transport']}", style=CREAM)
+                        console.print(state)
                         s.sendall(b"OK\n" if proc else b"SKIP\n")
                     elif act == "stop":
                         if proc:
@@ -3264,6 +4031,7 @@ def benchmark_menu():
         except Exception as e:
             console.print(f"[red]✗ Benchmark error: {e}[/]")
         finally:
+            temporary.close()
             if proc:
                 proc.terminate()
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -3296,7 +4064,7 @@ def live_monitor_menu():
         conns = len(psutil.net_connections(kind="inet"))
         tunnels = list_tunnels()
 
-        net_panel = Panel(
+        net_panel = _cli_panel(
             f"[bold green]↓ RX (Download):[/] [bold white]{rx:6.2f} Mbps[/]   {_sparkline(rx_hist, 'green', 34)}\n"
             f"[bold magenta]↑ TX (Upload):  [/] [bold white]{tx:6.2f} Mbps[/]   {_sparkline(tx_hist, 'magenta', 34)}\n\n"
             f"[bold cyan]CPU:[/] {_mini_bar(cpu, 14, 'cyan')} {cpu:4.1f}%   "
@@ -3306,7 +4074,7 @@ def live_monitor_menu():
             border_style="cyan", box=box.ROUNDED
         )
 
-        tbl = Table(title="ACTIVE TUNNEL HEALTH", box=box.ROUNDED, border_style="magenta", expand=True)
+        tbl = Table(title=_section_title("ACTIVE TUNNEL HEALTH"), box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}", expand=True)
         tbl.add_column("Name", style="bold white")
         tbl.add_column("Engine", style="magenta")
         tbl.add_column("Transport", style="cyan")
@@ -3367,12 +4135,14 @@ def watchdog_menu():
         st_str = "[bold green]● ACTIVE[/]" if active else "[bold red]○ STOPPED[/]"
         tg_str = "[green]CONFIGURED[/]" if (cfg.get("tg_token") and cfg.get("tg_chat_id")) else "[dim]Not Set[/]"
 
-        console.print(Panel(
-            f"Watchdog Service: {st_str}   Interval: [cyan]{cfg.get('interval', 30)}s[/]   Telegram Alerts: {tg_str}\n\n"
-            "[green][1] Enable / Start Watchdog[/]     [yellow][2] Disable / Stop Watchdog[/]\n"
-            "[cyan][3] Set Check Interval (sec)[/]     [magenta][4] Configure Telegram Bot Alerts[/]\n"
-            "[white][5] Send Test Telegram Alert[/]    [dim][0] Back to Main Menu[/]",
-            title="[bold cyan]SMART WATCHDOG & TELEGRAM ALERTS[/]", border_style="cyan", box=box.ROUNDED
+        console.print(f"Watchdog {st_str}  ·  Interval {cfg.get('interval', 30)}s  ·  Telegram {tg_str}")
+        _print_cli_options("WATCHDOG & ALERTS", (
+            ("1", "Enable / Start Watchdog", ""),
+            ("2", "Disable / Stop Watchdog", ""),
+            ("3", "Set Check Interval", "seconds"),
+            ("4", "Configure Telegram Bot Alerts", ""),
+            ("5", "Send Test Telegram Alert", ""),
+            ("0", "Back to Main Menu", ""),
         ))
         ch = Prompt.ask("Action", choices=["0", "1", "2", "3", "4", "5"], default="0")
         if ch == "0":
@@ -3422,7 +4192,7 @@ def _smart_mtu_finder():
         else:
             hi = mid - 1
     path_mtu = best + 28
-    console.print(Panel(
+    console.print(_cli_panel(
         f"[bold green]✔ Discovered Path MTU to {target}:[/] [bold white]{path_mtu} bytes[/] (max ICMP payload: {best})\n\n"
         f"  • [cyan]GRE / GRETAP over IPsec:[/] [bold white]{max(1200, path_mtu - 100)}[/]\n"
         f"  • [cyan]WireGuard / Kerov-UDP:[/]   [bold white]{max(1200, path_mtu - 140)}[/]\n"
@@ -3435,11 +4205,10 @@ def _smart_mtu_finder():
 
 def _backup_restore_menu():
     render_header()
-    console.print(Panel(
-        "[bold cyan][1] 💾 Create Full Backup[/]   [dim]Saves /etc/kerov + systemd units to /root/kerov-backup-*.tar.gz[/]\n"
-        "[bold yellow][2] ♻️ Restore Backup[/]       [dim]Restores configs & restarts all saved tunnel services[/]\n"
-        "[dim][0] Back[/]",
-        title="[bold cyan]BACKUP & RESTORE[/]", border_style="cyan", box=box.ROUNDED
+    _print_cli_options("BACKUP & RESTORE", (
+        ("1", "Create Full Backup", "Save configs and systemd units"),
+        ("2", "Restore Backup", "Restore configs and restart saved tunnel services"),
+        ("0", "Back", ""),
     ))
     c = Prompt.ask("Select", choices=["0", "1", "2"], default="1")
     if c == "1":
@@ -3462,9 +4231,18 @@ def _backup_restore_menu():
         with tarfile.open(p, "r:gz") as tf:
             tf.extractall("/")
         run_cmd("systemctl daemon-reload")
+        failed = []
         for t in list_tunnels():
-            run_cmd(["systemctl", "enable", "--now", t['service']])
-        console.print("[bold green]✔ Backup restored and all tunnel services started![/]")
+            try:
+                if t["engine"] == "ctunnel":
+                    cfg = json.loads(Path(t["config"]).read_text(encoding="utf-8"))
+                    deploy_ctunnel(cfg, t["role"], t.get("sync_link", ""), update=True)
+                else:
+                    run_cmd(["systemctl", "enable", "--now", t['service']], check=True)
+            except (RuntimeError, ValueError, OSError, subprocess.CalledProcessError) as error:
+                failed.append(t["name"])
+                console.print(Text(f"{t['name']}: {error}", style=BAD_C))
+        console.print("[yellow]Backup restored with service errors.[/]" if failed else "[green]Backup restored and services started.[/]")
         pause()
 
 
@@ -3501,12 +4279,11 @@ net.ipv4.tcp_mtu_probing = 1
 def network_toolkit_menu():
     while True:
         render_header()
-        console.print(Panel(
-            "[bold cyan][1] 📏 Smart MTU Finder[/]            [dim]Find exact optimal MTU to Foreign server (prevents freeze)[/]\n"
-            "[bold cyan][2] 💾 Backup / Restore Tunnels[/]    [dim]1-Click export/import all Kerov configs & services[/]\n"
-            "[bold cyan][3] Kernel & Firewall Optimizer[/] [dim]Apply BBR + TCP Fast Open + open tunnel ports[/]\n"
-            "[dim][0] Back to Main Menu[/]",
-            title="[bold cyan]🔧 NETWORK TOOLKIT[/]", border_style="cyan", box=box.ROUNDED
+        _print_cli_options("NETWORK TOOLKIT", (
+            ("1", "Smart MTU Finder", "Measure path MTU"),
+            ("2", "Backup / Restore Tunnels", "Export or import configs and services"),
+            ("3", "Kernel & Firewall Optimizer", "Apply BBR and TCP Fast Open, open tunnel ports"),
+            ("0", "Back to Main Menu", ""),
         ))
         ch = Prompt.ask("Select", choices=["0", "1", "2", "3"], default="0")
         if ch == "0":
@@ -3520,10 +4297,11 @@ def network_toolkit_menu():
 
 def server_core_status():
     render_header()
-    tbl = Table(title="INSTALLED CORES & SYSTEM STATUS", box=box.ROUNDED, border_style="cyan", expand=True)
+    console.print(Rule(_section_title("CORE STATUS"), style=DIVIDER, align="left"))
+    tbl = Table(box=box.SIMPLE_HEAD, border_style=DIVIDER, header_style=f"bold {CREAM}", expand=True)
     tbl.add_column("Core Engine", style="bold white")
-    tbl.add_column("Direction", style="yellow")
-    tbl.add_column("Binary Path", style="dim")
+    tbl.add_column("Direction", style=MUTED)
+    tbl.add_column("Binary Path", style=MUTED, overflow="fold")
     tbl.add_column("Status", style="bold")
 
     rows = [
@@ -3539,15 +4317,28 @@ def server_core_status():
         ("QS-Tunnel Client", "Direct (Iran=Cli)", BINS["qs-client"]),
         ("QS-Tunnel Server", "Direct (Foreign=Srv)", BINS["qs-server"]),
         ("ICMP Tunnel", "Direct (Iran=Cli)", BINS["icmp"]),
+        ("C-Tunnel", "Direct / Reverse", BINS["ctunnel"]),
     ])
     for label, d, path in rows:
-        ok_bin = os.access(path, os.X_OK)
-        tbl.add_row(label, d, path, "[bold green]✔ INSTALLED[/]" if ok_bin else "[bold red]✗ MISSING[/]")
+        ok_bin = _ctunnel_ready() if path == BINS["ctunnel"] else os.access(path, os.X_OK)
+        status = "[bold green]✔ INSTALLED[/]" if ok_bin else "[bold red]✗ MISSING[/]"
+        if path == BINS["icmp"] and not ok_bin:
+            status = "[yellow]CORE FILE REQUIRED[/]"
+        tbl.add_row(label, d, path, status)
     console.print(tbl)
+    if not os.access(BINS["icmp"], os.X_OK):
+        console.print(Text("ICMP install: rerun sudo bash kerov-install.sh --cli-only. Offline: add --icmp-core /path/to/ICMPTunnel-linux-amd64.", style=MUTED))
     pause()
 
 
 def _cleanup_tunnel(t: dict):
+    if t.get("engine") == "ctunnel":
+        with (KEROV_ETC / ".ctunnel.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            _remove_ctunnel_native(t["native_name"])
+            Path(t["config"]).unlink(missing_ok=True)
+            (META_DIR / f"{t['name']}.json").unlink(missing_ok=True)
+        return
     svc = t.get("service", f"kerov-{t.get('name', '')}")
     stopped = run_cmd(["systemctl", "disable", "--now", svc])
     if t.get("engine") in (RETIRED_PRIVATE_IP_ENGINE, *ADDED_ENGINES) and stopped.returncode != 0:
@@ -3586,7 +4377,7 @@ def _cleanup_tunnel(t: dict):
 
 def uninstall_kerov():
     render_header()
-    console.print(Panel(
+    console.print(_cli_panel(
         "[bold red]WARNING:[/] This will stop & remove all Kerov Tunnel services, configs, and the CLI itself.",
         title="[bold red]UNINSTALL KEROV TUNNEL[/]", border_style="red", box=box.ROUNDED
     ))
@@ -3620,51 +4411,45 @@ def uninstall_kerov():
 # ==============================================================================
 
 MAIN_MENU_LEFT = (
-    ("01", "Create Tunnel", "rev·direct"),
-    ("02", "Manage Tunnels", "logs·sync"),
-    ("03", "Smart Benchmark", "dl/ul"),
-    ("04", "Live Monitor", "realtime"),
+    ("01", "Create Tunnel", "Direct / Reverse"),
+    ("02", "Manage Tunnels", "Services, logs & sync"),
+    ("03", "Smart Benchmark", "Test & compare"),
+    ("04", "Live Monitor", "Traffic & resources"),
 )
 MAIN_MENU_RIGHT = (
-    ("05", "Watchdog & Alerts", "telegram"),
-    ("06", "Network Toolkit", "mtu·bbr"),
-    ("07", "Core Status", "engines"),
+    ("05", "Watchdog & Alerts", "Recovery & Telegram"),
+    ("06", "Network Toolkit", "MTU, BBR & tuning"),
+    ("07", "Core Status", "Installed engines"),
     ("08", "Uninstall", ""),
 )
 
 
-def _section_title(title: str, width: int = 0) -> Text:
-    t = Text(no_wrap=True, overflow="crop")
-    t.append(" ◆ ", style=GOLD[2])
-    t.append(title, style=f"bold {GOLD[2]}")
-    if width:
-        t.append(" " + "─" * max(0, width - len(title) - 5), style=G_DIM)
-    return t
+def _section_title(title: str) -> Text:
+    return Text(title, style=f"bold {ACCENT}")
 
 
 def _menu_cell(num: str, name: str, desc: str, danger: bool = False) -> Text:
-    t = Text(no_wrap=True, overflow="ellipsis")
-    t.append(" ")
-    t.append(f" {num} ", style=f"bold #0b0b12 on {BAD_C if danger else GOLD[3]}")
-    t.append(" ")
-    t.append(name.ljust(19), style=f"bold {BAD_C}" if danger else f"bold {CREAM}")
-    t.append(desc, style=MUTED)
-    return t
+    line = Text(f" {num.upper():>2}   ", style=f"bold {ACCENT}")
+    line.append(name, style=f"bold {BAD_C if danger else CREAM}")
+    if desc:
+        line.append(f"   ·   {desc}", style=MUTED)
+    return line
 
 
-def _render_main_menu(w: int):
-    grid = Table.grid(expand=True, padding=(0, 1))
-    grid.width = w
-    grid.add_column(ratio=1, no_wrap=True)
-    grid.add_column(ratio=1, no_wrap=True)
-    grid.add_row(_section_title("TUNNELS"), _section_title("SYSTEM"))
-    for (ln, lt, ld), (rn, rt, rd) in zip(MAIN_MENU_LEFT, MAIN_MENU_RIGHT):
-        grid.add_row(_menu_cell(ln, lt, ld), _menu_cell(rn, rt, rd, danger=(rn == "08")))
-    console.print(grid)
+def _print_cli_options(title, options):
+    console.print(Rule(_section_title(title), style=DIVIDER, align="left"))
+    for option in options:
+        console.print(_menu_cell(*option))
+
+
+def _render_main_menu():
+    _print_cli_options("TUNNELS", MAIN_MENU_LEFT)
+    console.print()
+    _print_cli_options("SYSTEM", MAIN_MENU_RIGHT)
 
 
 def _render_tunnel_list(w: int):
-    console.print(_section_title("LIVE TUNNELS", w))
+    console.print(Rule(_section_title("LIVE TUNNELS"), style=DIVIDER, align="left"))
     tunnels = list_tunnels()
     if not tunnels:
         console.print(Text("    No tunnels yet · press 01 to create one", style=MUTED, no_wrap=True))
@@ -3672,35 +4457,44 @@ def _render_tunnel_list(w: int):
         g = Table.grid(padding=(0, 1), expand=True)
         g.width = w
         g.add_column(width=3, no_wrap=True)
-        g.add_column(width=14, no_wrap=True, overflow="ellipsis")
-        g.add_column(width=24, no_wrap=True, overflow="ellipsis")
-        g.add_column(width=13, no_wrap=True)
-        g.add_column(ratio=1, no_wrap=True, overflow="ellipsis")
+        g.add_column(no_wrap=True, overflow="ellipsis")
+        g.add_column(ratio=1)
+        g.add_column(no_wrap=True)
+        if w >= 58:
+            g.add_column(ratio=1, overflow="ellipsis")
         for t in tunnels[:5]:
             up = t["status"] == "active"
             color = OK_C if up else BAD_C
-            g.add_row(
-                Text("  ●", style=color),
+            endpoint = str(t.get("endpoint", ""))
+            method = Text(f"{t.get('engine', '?')} · {t.get('transport', '?')}", style=MUTED)
+            if w < 58 and endpoint:
+                method.append(f"\n{endpoint}")
+            cells = [
+                Text(" ●", style=color),
                 Text(str(t.get("name", "?")), style=f"bold {CREAM}"),
-                Text(f"{t.get('engine', '?')} · {t.get('transport', '?')}", style=MUTED),
+                method,
                 Text(_instance_status(t["engine"], t["status"], "ONLINE").lower(), style=color),
-                Text(str(t.get("endpoint", "")), style=MUTED),
-            )
+            ]
+            if w >= 58:
+                cells.append(Text(endpoint, style=MUTED))
+            g.add_row(*cells)
         console.print(g)
         if len(tunnels) > 5:
             console.print(Text(f"    +{len(tunnels) - 5} more · open 02 to manage", style=MUTED, no_wrap=True))
 
     win = _last_winner()
     line = Text(no_wrap=True, overflow="ellipsis")
-    line.append("  ★ ", style=GOLD[1])
+    line.append("  ★ ", style=ACCENT)
     line.append("best route  ", style=MUTED)
     if win and win.get("winner"):
         b = win["winner"]
         mbps = float(b.get("mbps", 0) or 0)
         rtt = float(b.get("rtt", 0) or 0)
-        line.append(f"{str(b.get('engine', '')).upper()} / {b.get('transport', '')}", style=f"bold {GOLD[1]}")
+        line.append(f"{str(b.get('engine', '')).upper()} / {b.get('transport', '')}", style=f"bold {ACCENT}")
         line.append(f"  {mbps:.0f} Mbps · {rtt:.0f} ms · grade ", style=MUTED)
-        line.append(_grade_letter(mbps, rtt), style=f"bold {GOLD[0]}")
+        line.append(_grade_letter(mbps, rtt), style=f"bold {CREAM}")
+        if b.get("engine") == "kerov-udp":
+            line.append("  ·  estimate", style=WARN_C)
     else:
         line.append("no benchmark yet · press 03", style=MUTED)
     console.print(line)
@@ -3737,23 +4531,23 @@ def main():
     }
 
     while True:
-        render_header()
+        render_header(main_menu=True)
         w = console.width
-        _render_main_menu(w)
+        _render_main_menu()
         console.print()
         _render_tunnel_list(w)
         render_footer_bar()
 
         flush_stdin()
         try:
-            raw = Prompt.ask(f" [bold {GOLD[2]}]❯[/]", default="", show_default=False).strip().lower()
+            raw = Prompt.ask(f" [bold {ACCENT}]❯[/]", default="", show_default=False).strip().lower()
         except EOFError:
             break
         if raw.isdigit():
             raw = str(int(raw))
         choice = key_map.get(raw)
         if choice == "0":
-            console.print(Text("\n  ◆ Goodbye.\n", style=GOLD[2]))
+            console.print(Text("\n  ◆ Goodbye.\n", style=ACCENT))
             break
         if choice in actions:
             actions[choice]()
