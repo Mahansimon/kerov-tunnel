@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  Kerov Tunnel v2.2.2 — All-in-One Installer (6 Cores • Offline-First • Ubuntu 22+)
+#  Kerov Tunnel v2.3.4 — All-in-One Installer (9 Engines • Offline-First • Ubuntu 22+)
 # ==============================================================================
 set -euo pipefail
 
@@ -21,19 +21,48 @@ CORES_DIR="$SRC_DIR/cores"
 KEROV_DIR="/opt/kerov"
 KEROV_ETC="/etc/kerov"
 
+install_added_cores() {
+  case "$(uname -m)" in
+    x86_64|amd64) ;;
+    *) warn "LeechTunnel, QS-Tunnel and ICMPTunnel builds require amd64."; return 0 ;;
+  esac
+  local core_dir=/usr/local/lib/kerov/cores source target staging
+  install -d -m 0755 "$core_dir"
+  while read -r source target; do
+    if [ -f "$CORES_DIR/$source" ]; then
+      staging="$(mktemp "$core_dir/.$target.XXXXXX")"
+      if ! install -m 0755 "$CORES_DIR/$source" "$staging" || ! mv -f "$staging" "$core_dir/$target"; then
+        rm -f -- "$staging"
+        err "Could not install $target."
+      fi
+      ok "$target core installed from the bundle."
+    elif [ ! -x "$core_dir/$target" ]; then
+      warn "Bundled $source not found."
+    fi
+  done <<'EOF'
+leech-linux-amd64 leech
+qs-client-linux-amd64 qs-client
+qs-server-linux-amd64 qs-server
+EOF
+  if [ ! -x "$core_dir/ICMPTunnel" ]; then
+    info "ICMP Tunnel accepts a separately installed core. See README.md."
+  fi
+}
+
 install_cli() {
   install -d "$KEROV_DIR"
   install -m 0755 "$SRC_DIR/kerov.py" "$KEROV_DIR/kerov.py"
   ln -sf "$KEROV_DIR/kerov.py" /usr/local/bin/kerov
-  ok "Kerov Tunnel v2.2.2 installed! Launch anytime with: sudo kerov"
+  ok "Kerov Tunnel v2.3.4 installed! Launch anytime with: sudo kerov"
 }
 
 if [ "${1:-}" = "--cli-only" ]; then
-  for dependency in python3 ip systemctl flock; do
+  for dependency in python3 ip systemctl; do
     command -v "$dependency" >/dev/null 2>&1 || err "Required command not found: $dependency"
   done
   PYTHONPATH="$KEROV_DIR" python3 -c 'import rich, yaml, psutil' 2>/dev/null ||
     err "Install the Kerov Python dependencies (rich, PyYAML and psutil) before using --cli-only. See README.md."
+  install_added_cores
   install_cli
   exit 0
 fi
@@ -51,7 +80,7 @@ cat <<'EOF'
   ╦╔═╔═╗╦═╗╔═╗╦  ╦  ╔╦╗╦ ╦╔╗╔╔╗╔╔═╗╦
   ╠╩╗║╣ ╠╦╝║ ║╚╗╔╝   ║ ║ ║║║║║║║║╣ ║
   ╩ ╩╚═╝╩╚═╚═╝ ╚╝    ╩ ╚═╝╝╚╝╝╚╝╚═╝╩═╝
-      All-in-One Installer v2.2.2
+      All-in-One Installer v2.3.4
 EOF
 echo -e "${C_N}"
 
@@ -184,7 +213,8 @@ net.ipv4.tcp_mtu_probing = 1
 EOF
 sysctl --system >/dev/null 2>&1 || true
 
-# 7) Install Kerov CLI
+# 7) Install additional engines and the Kerov CLI
+install_added_cores
 install_cli
 echo ""
 if [ -t 0 ]; then exec /usr/local/bin/kerov; fi
