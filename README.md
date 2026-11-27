@@ -1,4 +1,4 @@
-# Kerov Tunnel v2.3.10
+# Kerov Tunnel v2.3.14
 
 Multi-core tunnel manager & smart benchmark CLI for Ubuntu 22.04+ (amd64 / arm64).
 
@@ -24,8 +24,8 @@ update the CLI and install the bundled cores without downloading packages or
 restarting existing tunnels.
 
 ```bash
-unzip Kerov-Tunnel-v2.3.10.zip -d kerov-v2.3.10
-cd kerov-v2.3.10/kerov-tunnel
+unzip Kerov-Tunnel-v2.3.14.zip -d kerov-v2.3.14
+cd kerov-v2.3.14/kerov-tunnel
 sudo bash kerov-install.sh --offline
 sudo kerov
 ```
@@ -49,8 +49,12 @@ sudo bash kerov-install.sh --offline
 ```
 
 The offline option skips OS package installation and network downloads. It
-installs C-Tunnel and the bundled LeechTunnel and QS-Tunnel binaries for their
-supported architectures. A new offline ICMP installation needs the local binary
+installs C-Tunnel and the bundled BrokenNode, DaggerConnect, Backhaul Premium,
+paqet-plus, LeechTunnel and QS-Tunnel binaries for their supported architectures. paqet-plus v1.0.0-alpha.41 is bundled
+for Linux amd64 and arm64, with per-binary SHA-256 checks during installation and
+its MIT license in `cores/`. Linux amd64 builds of QS-Tunnel and BrokenNode are
+included. On a fresh offline host, DaggerConnect also needs an installed libpcap
+runtime. A new offline ICMP installation needs the local binary
 passed with `--icmp-core`. Older engines that have not already been installed
 may need the full Kerov installer and distribution packages.
 
@@ -115,12 +119,19 @@ server, plus a host and provider that permit the core's raw packet mode.
 `udp` modes send the download payload without OBFS encryption. The Iran service
 limits plain UDP downloads to the configured Foreign IPv4 or source override.
 
-Supply an existing, reachable SOCKS5 server for upload traffic. It must support
-unauthenticated SOCKS5 connections and be able to connect to the Foreign QS TCP
-port. Enter the upload proxy's egress IPv4 as seen by Foreign. The Foreign
-service restricts uploads to that source. Allow inbound download UDP to the
-configured public IPv4 and port on Iran. If Iran is behind NAT, forward that
-UDP port to the Iran server.
+Keep **QS upload route** set to `auto` to use the bundled loopback-only upload
+relay. Kerov starts it with the QS client for both regular tunnels and temporary
+benchmarks. The relay only accepts connections to the configured Foreign QS TCP
+endpoint. Use the Iran public IPv4 as seen from Foreign. If the direct TCP
+route is unavailable or it exits from a different IPv4, enter an existing
+unauthenticated SOCKS5 address and its actual egress IPv4 instead. The Foreign
+service restricts uploads to that source.
+
+Allow inbound download UDP to the advertised public IPv4 and port on Iran. If
+Iran is behind NAT, forward that UDP port to the Iran server. A new sync link
+with `auto` activates the bundled relay. Existing QS services keep their
+configured upload proxy. To switch an existing pair, create and sync a QS
+instance with `auto`, using free ports or replacing the old pair.
 
 Test traffic using the local SOCKS5 endpoint on Iran:
 
@@ -214,25 +225,26 @@ terminal or SSH client.
 The terminal board shows the current case and recent results while the test
 runs. **Echo** counts successful replies out of five. **OK** means all echoes
 and both transfers succeeded. **Unstable** flags missing echoes or an incomplete
-transfer. **Estimate** identifies the preset Kerov-UDP row in the matrix.
-The results table includes direction, download, upload, RTT, jitter, loss and
+transfer.
+The results table includes direction, download, upload, RTT, jitter, echo loss and
 grade, with a stacked layout for narrower terminals.
 
 ## Benchmark before creating a tunnel
 
-Update both servers to v2.3.10. Use **Smart Benchmark → Iran Server → Full Mode**
-for the 94-case matrix, or select `leech,qs,icmp` under **Custom Cores** to test
+Update both servers to v2.3.14. Use **Smart Benchmark → Iran Server → Full Mode**
+for the 96-case matrix, or select `leech,qs,icmp` under **Custom Cores** to test
 just those three engines. On Foreign, use **Peer Agent** with the generated
 `kerov-test://` link.
 
-The 45 earlier cases remain in the matrix. Leech adds 44 cases across Direct and
+The original 45 cases remain in the matrix. Dagger TUN adds the BIP and IPIP profiles. Leech adds 44 cases across Direct and
 Reverse, including its TUN encapsulations and IPX profiles. QS adds four cases
 and ICMP adds one. Kerov creates temporary endpoints for these engines, runs
 echo and throughput probes through each one, and stops the endpoints after each
 case. Temporary endpoints do not appear in Manage Tunnels.
 
-QS needs a working upload SOCKS5 proxy and its egress IPv4. QS spoof variants use
-an IPv4 assigned on Foreign. ICMP needs the separate core on both hosts and the
+QS uses the same `auto` upload default as tunnel creation. The benchmark reports
+upload reachability separately from authenticated echo failures. QS spoof
+variants use an IPv4 assigned on Foreign. ICMP needs the separate core on both hosts and the
 sysctl described above. Use **Benchmark Managed Tunnel** for an already
 configured ICMP instance. Leech tests use its configured license, selected
 carrier and the host capabilities that carrier requires. Setup errors appear
@@ -242,6 +254,64 @@ The benchmark does not change provider firewall rules. The peer has up to five
 minutes to connect. Each transfer has a 100-second budget and tolerates up to
 25 seconds of inactivity. A failed case is scored and the matrix continues
 while the control connection stays up.
+
+For BrokenNode IP-Spoofing, enable the optional cases in **Full Mode** or
+**Custom Cores** with `brokennode` selected to test both Direct and Reverse.
+**Direct Only** and **Reverse Only** add their respective direction. Each
+selected carrier (`udp`, `tcp`, `icmp`, or `gre`) gets a separate test in
+each selected direction. Direct probes from Foreign and uses a temporary
+authenticated echo listener on Iran. For Direct, update both ends to v2.3.14.
+
+Dagger TUN matrix cases use the core's IPX configuration and dial the peer's
+private address through the temporary TUN interface. This covers TCP, UDP,
+ICMP, GRE, IPIP and BIP profiles. The matrix uses temporary endpoints and
+carrier ports where applicable. Use a managed benchmark to measure an existing
+Dagger instance with its own configuration and ports.
+
+**Echo loss** reports failed small TCP echo probes. Download and upload have
+their own results. A transfer can fail when echo loss is zero. An unmeasured
+echo loss is shown as a dash. QS throughput uses 256 KiB per direction in
+acknowledged 8 KiB blocks to prevent the test from overrunning its asymmetric
+UDP return path. Its reported rates measure that transfer pattern.
+
+BrokenNode QUIC and QUICD, Backhaul, and paqet-plus use synchronized temporary
+endpoints. QUIC and QUICD use the same ALPN as managed tunnels. Backhaul uses
+the same config generator as managed tunnels. Backhaul and Leech TUN measure
+through the TUN addresses, including the return path. The benchmark waits for
+an authenticated echo before it collects samples. Startup errors and recent
+core messages are shown separately from missing echo responses.
+
+The carrier ports still need to be reachable between servers. BrokenNode
+QUIC/QUICD use the case's temporary UDP port. paqet-plus needs IPv4 Ethernet
+routing on each host. Leech and QS raw modes depend on the host and provider
+supporting the selected carrier. ICMP remains subject to the core and host
+requirements above.
+
+## Benchmark Kerov-UDP
+
+Update both servers to v2.3.14. The Kerov-UDP row in **Quick Mode**, **Full
+Mode**, **Direct Only**, and **Custom Cores** uses temporary kernel WireGuard
+interfaces over udp2raw FakeTCP. The benchmark exchanges temporary public
+keys and measures TCP echo, download and upload through the WireGuard link.
+It waits for a real authenticated echo before collecting samples. When setup
+fails or the echo does not return, the row shows the failure and its diagnostics.
+
+Install WireGuard kernel support, `wireguard-tools`, `iproute2`, `iptables`,
+and `udp2raw` on both servers. The full installer attempts to install these
+tools and the udp2raw core. The offline installer can install a supplied
+`cores/udp2raw` binary for the server's architecture. The FakeTCP carrier uses
+the Foreign server's temporary TCP port (49200 plus the case's zero-based
+matrix position). The WireGuard UDP port is local to each server. The test
+removes its temporary interfaces and firewall rules after the case.
+
+## Benchmark a running Dagger TUN
+
+On either server, select **Smart Benchmark → Benchmark Managed Tunnel** and
+choose the running Dagger TUN instance. Paste the generated link in **Peer
+Agent** on the other server, then confirm the test on the first server. The
+echo listener uses the tunnel's private peer IPv4 and TUN interface. The default
+echo TCP port is 49500 and can be changed to an unused port. The test does not
+create a replacement tunnel or change the running service.
 
 ## Benchmark a running Leech, QS or ICMP tunnel
 

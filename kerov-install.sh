@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  Kerov Tunnel v2.3.10 — All-in-One Installer (10 Engines • Offline-First • Ubuntu 22+)
+#  Kerov Tunnel v2.3.14 — All-in-One Installer (10 Engines • Offline-First • Ubuntu 22+)
 # ==============================================================================
 set -euo pipefail
 
@@ -42,6 +42,48 @@ done
 if [ -n "$icmp_core" ] && [ ! -f "$icmp_core" ]; then
   err "ICMP core file not found: $icmp_core"
 fi
+
+install_brokennode_core() {
+  local source="$CORES_DIR/brokennode-linux-amd64" target=/usr/local/bin/brokennode staging
+  case "$(uname -m)" in
+    x86_64|amd64)
+      if [ ! -f "$source" ]; then
+        [ -x "$target" ] || warn "Bundled BrokenNode amd64 core not found."
+        return 0
+      fi
+      staging="$(mktemp /usr/local/bin/.brokennode.XXXXXX)"
+      if ! install -m 0755 "$source" "$staging" || ! mv -f "$staging" "$target"; then
+        rm -f -- "$staging"
+        err "Could not install BrokenNode."
+      fi
+      ok "BrokenNode core installed from the bundle (amd64)."
+      ;;
+    *) warn "Bundled BrokenNode core requires Linux amd64." ;;
+  esac
+}
+
+install_paqet_core() {
+  local arch source target=/opt/paqet-plus/paqet-plus staging
+  case "$(uname -m)" in
+    x86_64|amd64) arch=amd64 ;;
+    aarch64|arm64) arch=arm64 ;;
+    *) warn "No bundled paqet-plus core for this architecture."; return 0 ;;
+  esac
+  source="paqet-plus-linux-$arch"
+  if [ ! -f "$CORES_DIR/$source" ]; then
+    [ -x "$target" ] && return 0
+    err "Bundled paqet-plus core missing: cores/$source"
+  fi
+  (cd "$CORES_DIR" && awk -v binary="$source" '$2 == binary {print}' paqet-plus-SHA256SUMS | sha256sum -c --status) ||
+    err "Bundled paqet-plus checksum mismatch: $source"
+  install -d -m 0755 /opt/paqet-plus
+  staging="$(mktemp /opt/paqet-plus/.paqet-plus.XXXXXX)"
+  if ! install -m 0755 "$CORES_DIR/$source" "$staging" || ! mv -f "$staging" "$target"; then
+    rm -f -- "$staging"
+    err "Could not install paqet-plus."
+  fi
+  ok "paqet-plus core installed from the bundle ($arch)."
+}
 
 install_added_cores() {
   case "$(uname -m)" in
@@ -192,11 +234,66 @@ EOF
   fi
 )
 
+install_dagger_and_backhaul() {
+  local glibc_version runtime
+  case "$(uname -m)" in
+    x86_64|amd64) ;;
+    *) warn "Bundled DaggerConnect and Backhaul cores require Linux amd64."; return 0 ;;
+  esac
+  if [ -f "$CORES_DIR/DaggerConnect" ]; then
+    glibc_version=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
+    if python3 -c 'import sys; v=tuple(map(int,sys.argv[1].split("."))); sys.exit(0 if v>=(2,34) else 1)' "${glibc_version:-2.35}"; then
+      install -m 0755 "$CORES_DIR/DaggerConnect" /usr/local/bin/DaggerLauncher
+    elif [ -f "$CORES_DIR/runtime.tar.gz" ]; then
+      runtime="/usr/local/lib/DaggerConnect-offline-v4.3.1"
+      mkdir -p "$runtime/lib"
+      tar -xzf "$CORES_DIR/runtime.tar.gz" -C "$runtime/lib"
+      install -m 0755 "$CORES_DIR/DaggerConnect" "$runtime/DaggerConnect"
+      printf '#!/bin/sh\nexec "%s/lib/ld-linux-x86-64.so.2" --library-path "%s/lib" "%s/DaggerConnect" "$@"\n' "$runtime" "$runtime" "$runtime" > /usr/local/bin/DaggerLauncher
+      chmod 0755 /usr/local/bin/DaggerLauncher
+    else
+      install -m 0755 "$CORES_DIR/DaggerConnect" /usr/local/bin/DaggerLauncher
+    fi
+    ok "DaggerConnect core installed (offline)."
+  elif [ -x /usr/local/bin/DaggerLauncher ]; then
+    ok "DaggerConnect core already installed."
+  else
+    warn "Bundled DaggerConnect not found."
+  fi
+
+  if [ -f "$CORES_DIR/backhaul_premium" ]; then
+    install -m 0755 "$CORES_DIR/backhaul_premium" /usr/local/bin/backhaul_premium
+    install -d -m 0755 /root/backhaul-core
+    ln -sf /usr/local/bin/backhaul_premium /root/backhaul-core/backhaul_premium
+    ok "Backhaul Premium core installed (offline)."
+  elif [ -x /usr/local/bin/backhaul_premium ]; then
+    ok "Backhaul Premium core already installed."
+  else
+    warn "Bundled backhaul_premium not found."
+  fi
+}
+
+install_local_udp2raw() {
+  local target=/usr/local/bin/udp2raw staging
+  if [ -f "$CORES_DIR/udp2raw" ]; then
+    staging="$(mktemp /usr/local/bin/.udp2raw.XXXXXX)"
+    if ! install -m 0755 "$CORES_DIR/udp2raw" "$staging" || ! mv -f "$staging" "$target"; then
+      rm -f -- "$staging"
+      err "Could not install udp2raw."
+    fi
+    ok "udp2raw core installed from the bundle."
+  elif [ -x "$target" ]; then
+    ok "udp2raw core already installed."
+  else
+    return 1
+  fi
+}
+
 install_cli() {
   install -d "$KEROV_DIR"
   install -m 0755 "$SRC_DIR/kerov.py" "$KEROV_DIR/kerov.py"
   ln -sf "$KEROV_DIR/kerov.py" /usr/local/bin/kerov
-  ok "Kerov Tunnel v2.3.10 installed! Launch anytime with: sudo kerov"
+  ok "Kerov Tunnel v2.3.14 installed! Launch anytime with: sudo kerov"
 }
 
 if [ "$ctunnel_core_only" = true ]; then
@@ -212,6 +309,10 @@ if [ "$cli_only" = true ] || [ "$offline" = true ]; then
   PYTHONPATH="$KEROV_DIR" python3 -c 'import rich, yaml, psutil' 2>/dev/null ||
     err "Install the Kerov Python dependencies (rich, PyYAML and psutil) before using --cli-only. See README.md."
   install_ctunnel_core
+  install_brokennode_core
+  install_dagger_and_backhaul
+  install_paqet_core
+  install_local_udp2raw || warn "For Kerov-UDP, install udp2raw or include it in cores/udp2raw before running --offline."
   install_added_cores
   install_cli
   exit 0
@@ -229,7 +330,7 @@ cat <<'EOF'
   ╦╔═╔═╗╦═╗╔═╗╦  ╦  ╔╦╗╦ ╦╔╗╔╔╗╔╔═╗╦
   ╠╩╗║╣ ╠╦╝║ ║╚╗╔╝   ║ ║ ║║║║║║║║╣ ║
   ╩ ╩╚═╝╩╚═╚═╝ ╚╝    ╩ ╚═╝╝╚╝╝╚╝╚═╝╩═╝
-      All-in-One Installer v2.3.10
+      All-in-One Installer v2.3.14
 EOF
 echo -e "${C_N}"
 
@@ -255,82 +356,10 @@ python3 -c "import rich, yaml, psutil" 2>/dev/null || \
 mkdir -p "$KEROV_DIR" "$KEROV_ETC"/{brokennode,backhaul,paqet,dagger,gretap,udp,tls,meta} /etc/brokennode /etc/DaggerConnect /opt/paqet-plus /root/backhaul-core
 ok "System packages & directories ready."
 
-# 1) BrokenNode (offline bundled)
-if [ -f "$CORES_DIR/brokennode-linux-$ARCH" ]; then
-  install -m 0755 "$CORES_DIR/brokennode-linux-$ARCH" /usr/local/bin/brokennode
-  ok "BrokenNode core installed (offline)."
-elif [ -x /usr/local/bin/brokennode ]; then
-  ok "BrokenNode core already installed."
-else
-  warn "Bundled brokennode-linux-$ARCH not found."
-fi
-
-# 2) DaggerConnect offline v4.3.1 (offline bundled)
-if [ -f "$CORES_DIR/DaggerConnect" ]; then
-  GLIBC_VER=$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')
-  if python3 -c 'import sys; v=tuple(map(int,sys.argv[1].split("."))); sys.exit(0 if v>=(2,34) else 1)' "${GLIBC_VER:-2.35}"; then
-    install -m 0755 "$CORES_DIR/DaggerConnect" /usr/local/bin/DaggerLauncher
-  elif [ -f "$CORES_DIR/runtime.tar.gz" ]; then
-    RT="/usr/local/lib/DaggerConnect-offline-v4.3.1"
-    mkdir -p "$RT/lib"
-    tar -xzf "$CORES_DIR/runtime.tar.gz" -C "$RT/lib"
-    install -m 0755 "$CORES_DIR/DaggerConnect" "$RT/DaggerConnect"
-    printf '#!/bin/sh\nexec "%s/lib/ld-linux-x86-64.so.2" --library-path "%s/lib" "%s/DaggerConnect" "$@"\n' "$RT" "$RT" "$RT" > /usr/local/bin/DaggerLauncher
-    chmod 0755 /usr/local/bin/DaggerLauncher
-  else
-    install -m 0755 "$CORES_DIR/DaggerConnect" /usr/local/bin/DaggerLauncher
-  fi
-  ok "DaggerConnect core installed (offline)."
-elif [ -x /usr/local/bin/DaggerLauncher ]; then
-  ok "DaggerConnect core already installed."
-else
-  warn "Bundled DaggerConnect not found."
-fi
-
-# 3) Backhaul Premium (offline bundled)
-if [ -f "$CORES_DIR/backhaul_premium" ]; then
-  install -m 0755 "$CORES_DIR/backhaul_premium" /usr/local/bin/backhaul_premium
-  ln -sf /usr/local/bin/backhaul_premium /root/backhaul-core/backhaul_premium
-  ok "Backhaul Premium core installed (offline)."
-elif [ -x /usr/local/bin/backhaul_premium ]; then
-  ok "Backhaul Premium core already installed."
-else
-  warn "Bundled backhaul_premium not found."
-fi
-
-# 4) paqet-plus (offline-first -> fallback to GitHub)
-if [ -f "$CORES_DIR/paqet-plus" ]; then
-  install -m 0755 "$CORES_DIR/paqet-plus" /opt/paqet-plus/paqet-plus
-  ok "paqet-plus core installed (offline)."
-elif [ ! -x /opt/paqet-plus/paqet-plus ]; then
-  info "Downloading latest paqet-plus from GitHub..."
-  TAG=$(curl -fsSL --connect-timeout 10 "https://api.github.com/repos/LivingG0D/paqet-plus/releases?per_page=1" | jq -r '.[0].tag_name' 2>/dev/null || true)
-  if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-    TAG=$(curl -fsS --connect-timeout 10 -o /dev/null -w '%{redirect_url}' "https://github.com/LivingG0D/paqet-plus/releases/latest" 2>/dev/null | sed -n 's#.*/releases/tag/##p' || true)
-  fi
-  if [ -n "$TAG" ]; then
-    TMP=$(mktemp -d)
-    ASSET="paqet-plus-linux-${ARCH}-${TAG}.tar.gz"
-    if curl -fsSL --connect-timeout 15 -o "$TMP/$ASSET" "https://github.com/LivingG0D/paqet-plus/releases/download/${TAG}/${ASSET}" 2>/dev/null; then
-      tar -xzf "$TMP/$ASSET" -C "$TMP" 2>/dev/null || true
-      BIN=$(find "$TMP" -maxdepth 2 -type f -name 'paqet*' | head -1)
-      [ -n "$BIN" ] && install -m 0755 "$BIN" /opt/paqet-plus/paqet-plus && ok "paqet-plus ($TAG) installed."
-    else
-      warn "Could not download paqet-plus (GitHub blocked?)."
-    fi
-    rm -rf "$TMP"
-  else
-    warn "Could not reach GitHub for paqet-plus."
-  fi
-else
-  ok "paqet-plus already installed."
-fi
-
 # 5) udp2raw (offline-first -> fallback to GitHub)
-if [ -f "$CORES_DIR/udp2raw" ]; then
-  install -m 0755 "$CORES_DIR/udp2raw" /usr/local/bin/udp2raw
-  ok "udp2raw core installed (offline)."
-elif [ ! -x /usr/local/bin/udp2raw ]; then
+if install_local_udp2raw; then
+  :
+else
   info "Downloading udp2raw (FakeTCP engine) from GitHub..."
   TMP=$(mktemp -d)
   [ "$ARCH" = "amd64" ] && U2R_BIN="udp2raw_amd64" || U2R_BIN="udp2raw_arm"
@@ -341,8 +370,6 @@ elif [ ! -x /usr/local/bin/udp2raw ]; then
     warn "Could not download udp2raw (GitHub blocked?)."
   fi
   rm -rf "$TMP"
-else
-  ok "udp2raw already installed."
 fi
 
 # 6) Kernel BBR & forwarding tuning
@@ -363,6 +390,9 @@ EOF
 sysctl --system >/dev/null 2>&1 || true
 
 # 7) Install additional engines and the Kerov CLI
+install_brokennode_core
+install_dagger_and_backhaul
+install_paqet_core
 install_added_cores
 install_ctunnel_core
 install_cli

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kerov Tunnel v2.3.10 — Multi-Core Tunnel Manager & Smart Benchmark CLI
+Kerov Tunnel v2.3.14 — Multi-Core Tunnel Manager & Smart Benchmark CLI
 Engines:
   [Reverse] BrokenNode (12 transports incl. ip-spoofing)
             DaggerConnect v4.3.1 (13 transports)
@@ -30,6 +30,7 @@ import secrets
 import select
 import shutil
 import socket
+import socketserver
 import statistics
 import subprocess
 import sys
@@ -111,12 +112,14 @@ SAFE_SECRET_RE = re.compile(r"^[A-Za-z0-9+/=_-]{1,128}$")
 SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]{1,253}$")
 RETIRED_PRIVATE_IP_ENGINE = "manual-ip"
 ADDED_ENGINES = ("leech", "qs", "icmp")
+DAGGER_TUN_PROFILES = ("tcp", "udp", "icmp", "gre", "ipip", "bip")
 LEECH_TRANSPORTS = ("tcp", "tcpmux", "xtcpmux", "ws", "wss", "wsmux", "wssmux",
                     "xwsmux", "anytls", "kcp", "http", "https", "quantum", "tun")
 LEECH_TUN_ENCAPS = ("tcp", "ipx", "icmpx", "udpx")
 LEECH_IPX_PROFILES = ("icmp", "ipip", "udp", "tcp", "gre", "bip")
 LEECH_TLS = ("wss", "wssmux", "anytls", "https")
 QS_TRANSPORTS = ("udp", "obfs", "udp+spoof", "obfs+spoof")
+QS_AUTO_UPLOAD = "auto"
 LEECH_LICENSE = "LEECH-H34M-CLUX-3PMU-2REK"
 PRIVATE_V4_NETWORKS = tuple(
     ipaddress.IPv4Network(network)
@@ -386,7 +389,7 @@ def _sample_net_mbps(interval: float = 0.25):
 
 
 UI_MAX_W = 112
-KEROV_VERSION = "v2.3.10"
+KEROV_VERSION = "v2.3.14"
 if console.color_system in ("256", "truecolor"):
     ACCENT, DIVIDER = "#ff7861", "#785a50"
     CREAM, MUTED = "#f3eee7", "#b5ada4"
@@ -566,25 +569,20 @@ def ask_port_mappings(*, default_443=True, protocols=("tcp", "udp", "both")):
 #  ENGINE DEPLOYERS (IRAN + FOREIGN AUTO-SYNC)
 # ==============================================================================
 
-def deploy_brokennode(cfg: dict, side: str, sync_link: str = ""):
-    """Reverse Tunnel: Iran = server, Foreign = client"""
+def _brokennode_config(cfg, side):
     name = cfg["name"]
-    role = "server" if side == "iran" else "client"
     tr = cfg["transport"]
-    out_file = KEROV_ETC / "brokennode" / f"{name}.json"
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-
-    if cfg.get("passkey") and role == "server":
-        Path("/etc/brokennode").mkdir(parents=True, exist_ok=True)
-        pk_path = Path("/etc/brokennode/passkey")
-        pk_path.write_text(cfg["passkey"] + "\n", encoding="utf-8")
-        os.chmod(pk_path, 0o600)
-
+    direction = cfg.get("direction", "reverse")
+    if direction not in ("reverse", "direct") or (direction == "direct" and tr != "spoof"):
+        raise ValueError("BrokenNode Direct requires the IP-spoofing transport.")
+    listening_side = "iran" if direction == "reverse" else "foreign"
+    role = "server" if side == listening_side else "client"
     if tr == "spoof":
-        local_ip = cfg["iran_ip"] if role == "server" else cfg["foreign_ip"]
-        peer_ip = cfg["foreign_ip"] if role == "server" else cfg["iran_ip"]
-        s_src = cfg["spoof_w1"] if role == "server" else cfg["spoof_w2"]
-        s_dst = cfg["spoof_w2"] if role == "server" else cfg["spoof_w1"]
+        local_ip = cfg[f"{side}_ip"]
+        peer_side = "foreign" if side == "iran" else "iran"
+        peer_ip = cfg[f"{peer_side}_ip"]
+        s_src = cfg["spoof_w1"] if side == "iran" else cfg["spoof_w2"]
+        s_dst = cfg["spoof_w2"] if side == "iran" else cfg["spoof_w1"]
         tl, trr = ("10.10.20.1", "10.10.20.2") if role == "server" else ("10.10.20.2", "10.10.20.1")
         doc = {
             "mode": role, "transport": "spoof", "log_level": "info",
@@ -631,28 +629,42 @@ def deploy_brokennode(cfg: dict, side: str, sync_link: str = ""):
         elif tr in ("mtcp", "mtcpobf") and role == "client":
             doc["links"] = extra.get("links", 0)
 
+    return role, doc
+
+
+def deploy_brokennode(cfg: dict, side: str, sync_link: str = ""):
+    name, tr = cfg["name"], cfg["transport"]
+    role, doc = _brokennode_config(cfg, side)
+    direction = cfg.get("direction", "reverse")
+    listening_side = "iran" if direction == "reverse" else "foreign"
+    out_file = KEROV_ETC / "brokennode" / f"{name}.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    if cfg.get("passkey") and role == "server":
+        Path("/etc/brokennode").mkdir(parents=True, exist_ok=True)
+        pk_path = Path("/etc/brokennode/passkey")
+        pk_path.write_text(cfg["passkey"] + "\n", encoding="utf-8")
+        os.chmod(pk_path, 0o600)
+
     out_file.write_text(json.dumps(doc, indent=2), encoding="utf-8")
     os.chmod(out_file, 0o600)
 
     svc = f"kerov-bn-{name}"
     write_systemd(svc, f"BrokenNode ({name}/{tr})", f"{BINS['brokennode']} -c {out_file}")
     save_meta({
-        "name": name, "engine": "brokennode", "direction": "reverse",
+        "name": name, "engine": "brokennode", "direction": direction,
         "transport": tr, "role": role, "service": svc, "config": str(out_file),
-        "endpoint": f"{cfg['iran_ip']}:{cfg.get('tunnel_port', cfg.get('carrier_port', 0))}",
+        "endpoint": f"{cfg[f'{listening_side}_ip']}:{cfg.get('tunnel_port', cfg.get('carrier_port', 0))}",
         "sync_link": sync_link or encode_link("kerov", cfg),
     })
     return svc
 
 
-def deploy_dagger(cfg: dict, side: str, sync_link: str = ""):
-    """Reverse Tunnel: Iran = server, Foreign = client"""
+def _dagger_config(cfg, side, *, tun_addresses=None):
     name = cfg["name"]
     role = "server" if side == "iran" else "client"
     tr = cfg["transport"]
     actual_tr = "quantum" if tr == "quantum-gaming" else tr
-    out_file = KEROV_ETC / "dagger" / f"{name}.json"
-    out_file.parent.mkdir(parents=True, exist_ok=True)
 
     maps = [
         {"type": p["proto"], "bind": f"0.0.0.0:{p['bind']}", "target": f"127.0.0.1:{p['target']}"}
@@ -736,6 +748,8 @@ def deploy_dagger(cfg: dict, side: str, sync_link: str = ""):
         doc["xhttp"] = xh
     elif actual_tr == "tun":
         tl, trr = ("10.90.0.1", "10.90.0.2") if role == "server" else ("10.90.0.2", "10.90.0.1")
+        if tun_addresses is not None:
+            tl, trr = tun_addresses
         lip = cfg["iran_ip"] if role == "server" else get_public_ip()
         dip = extra["foreign_ip"] if role == "server" else cfg["iran_ip"]
         doc["tun"] = {
@@ -753,6 +767,14 @@ def deploy_dagger(cfg: dict, side: str, sync_link: str = ""):
             ipx["spoof_dst_ip"] = extra.get("spoof_dst", "") if role == "server" else extra["spoof_src"]
         doc["ipx"] = ipx
 
+    return role, doc
+
+
+def deploy_dagger(cfg: dict, side: str, sync_link: str = ""):
+    name, tr = cfg["name"], cfg["transport"]
+    role, doc = _dagger_config(cfg, side)
+    out_file = KEROV_ETC / "dagger" / f"{name}.json"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_text(json.dumps(doc, indent=2), encoding="utf-8")
     os.chmod(out_file, 0o600)
 
@@ -771,17 +793,13 @@ def deploy_dagger(cfg: dict, side: str, sync_link: str = ""):
     return svc
 
 
-def deploy_backhaul(cfg: dict, side: str, sync_link: str = ""):
-    """Reverse Tunnel: Backhaul Premium (TOML) — Iran = server, Foreign = client"""
+def _backhaul_config(cfg, side, *, tls_directory=None):
     name = cfg["name"]
     role = "server" if side == "iran" else "client"
     tr = cfg["transport"]
     extra = cfg.get("extra", {})
     is_tun = tr == "tun"
     is_ipx = is_tun and extra.get("tun_encapsulation") == "ipx"
-    out_file = KEROV_ETC / "backhaul" / f"{name}.toml"
-    out_file.parent.mkdir(parents=True, exist_ok=True)
-
     lines = []
     if not is_ipx:
         if role == "server":
@@ -866,7 +884,7 @@ def deploy_backhaul(cfg: dict, side: str, sync_link: str = ""):
         if tr == "anytls":
             lines.append(f'sni = "{extra.get("tls_sni", "www.digikala.com")}"')
         if role == "server":
-            cert, key = gen_self_signed_cert(f"bh-{name}", extra.get("tls_sni", "backhaul.com"))
+            cert, key = gen_self_signed_cert(f"bh-{name}", extra.get("tls_sni", "backhaul.com"), directory=tls_directory)
             lines += [f'tls_cert = "{cert}"', f'tls_key = "{key}"']
         lines.append("")
 
@@ -900,7 +918,18 @@ def deploy_backhaul(cfg: dict, side: str, sync_link: str = ""):
             lines.append(f'    "{m}",')
         lines.append("]")
 
-    out_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return role, "\n".join(lines)
+
+
+def deploy_backhaul(cfg: dict, side: str, sync_link: str = ""):
+    name, tr = cfg["name"], cfg["transport"]
+    extra = cfg.get("extra", {})
+    is_tun = tr == "tun"
+    role, contents = _backhaul_config(cfg, side)
+    out_file = KEROV_ETC / "backhaul" / f"{name}.toml"
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    out_file.write_text(contents + "\n", encoding="utf-8")
     os.chmod(out_file, 0o600)
 
     svc = f"kerov-bh-{name}"
@@ -1217,10 +1246,9 @@ def wizard_added_engine(engine, name, iran_ip, foreign_ip, *, direction="direct"
             download_src_port=IntPrompt.ask("QS download UDP source port on Foreign", default=9001),
             download_port=IntPrompt.ask("QS download UDP port on Iran", default=8000),
             socks_port=IntPrompt.ask("Local SOCKS5 port on Iran", default=1080),
-            upload_proxy=Prompt.ask("Existing upload SOCKS5 address (IPv4:port)", default="127.0.0.1:10808"),
-            upload_source=Prompt.ask("Upload proxy source IPv4 as seen by Foreign", default=iran_ip),
             psk=secrets.token_hex(32),
         )
+        cfg.update(_qs_upload_settings(iran_ip))
         if cfg["transport"].endswith("+spoof"):
             cfg["spoof_ip"] = Prompt.ask("IPv4 assigned to the Foreign server for the UDP source", default=foreign_ip)
     else:
@@ -1246,6 +1274,23 @@ def _added_ipv4(value):
     if ip.is_unspecified or ip.is_multicast:
         raise ValueError("Enter a unicast IPv4 address.")
     return str(ip)
+
+
+def _qs_upload_settings(iran_ip):
+    proxy = Prompt.ask("QS upload route (auto or existing SOCKS5 IPv4:port)", default=QS_AUTO_UPLOAD).strip()
+    if proxy.lower() == QS_AUTO_UPLOAD:
+        return {"upload_proxy": QS_AUTO_UPLOAD, "upload_source": iran_ip}
+    return {
+        "upload_proxy": proxy,
+        "upload_source": Prompt.ask("Upload proxy egress IPv4 seen by Foreign", default=iran_ip).strip(),
+    }
+
+
+def _qs_proxy_address(proxy):
+    if proxy == QS_AUTO_UPLOAD:
+        return proxy
+    host, _, port = proxy.rpartition(":")
+    return f"{_added_ipv4(host)}:{_added_port({'port': port}, 'port')}"
 
 
 def _added_secret(value, length):
@@ -1460,9 +1505,8 @@ def _added_engine_plan(cfg, side, *, tls_directory=None):
         mode, _, source_override = transport.partition("+")
         port = _added_port(cfg, "tunnel_port")
         endpoint = f"{foreign_ip}:{port}"
-        proxy_ip, proxy_port = cfg["upload_proxy"].rsplit(":", 1)
-        proxy = f"{_added_ipv4(proxy_ip)}:{_added_port({'proxy': proxy_port}, 'proxy')}"
-        source = _added_ipv4(cfg["upload_source"])
+        proxy = _qs_proxy_address(cfg.get("upload_proxy", QS_AUTO_UPLOAD))
+        source = _added_ipv4(cfg.get("upload_source") or iran_ip)
         config = {"transport_mode": mode, "dashboard_addr": "", "metrics_addr": "127.0.0.1:0"}
         if mode == "obfs":
             config["obfs_key"] = _added_secret(cfg["psk"], 64)
@@ -1539,6 +1583,67 @@ def _write_private(path, content):
         target.write("\n")
 
 
+class _QSUploadHandler(socketserver.BaseRequestHandler):
+    def handle(self):
+        client = self.request
+        client.settimeout(10)
+        try:
+            version, methods = _bench_read_exact(client, 2)
+            if version != 5 or 0 not in _bench_read_exact(client, methods):
+                client.sendall(b"\x05\xff")
+                return
+            client.sendall(b"\x05\x00")
+            if _bench_read_exact(client, 4) != b"\x05\x01\x00\x01":
+                return
+            address, port = self.server.destination
+            endpoint = ipaddress.IPv4Address(address).packed + port.to_bytes(2, "big")
+            if _bench_read_exact(client, 6) != endpoint:
+                client.sendall(b"\x05\x02\x00\x01" + bytes(6))
+                return
+            try:
+                upstream = socket.create_connection((address, port), timeout=8)
+            except OSError as error:
+                print(f"QS upload TCP to {address}:{port} failed: {error}", file=sys.stderr, flush=True)
+                client.sendall(b"\x05\x05\x00\x01" + bytes(6))
+                return
+            with upstream:
+                client.sendall(b"\x05\x00\x00\x01" + bytes(6))
+                client.settimeout(90)
+                upstream.settimeout(90)
+                destinations = {client: upstream, upstream: client}
+                while destinations:
+                    readable, _, _ = select.select(list(destinations), [], [])
+                    for source in readable:
+                        target = destinations[source]
+                        data = source.recv(65536)
+                        if data:
+                            target.sendall(data)
+                        else:
+                            target.shutdown(socket.SHUT_WR)
+                            del destinations[source]
+        except (OSError, EOFError):
+            return
+
+
+def _run_qs_auto_upload(config_path):
+    config = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    address, _, port = config["server_addr"].rpartition(":")
+    destination = (_added_ipv4(address), _added_port({"port": port}, "port"))
+    with socketserver.ThreadingTCPServer(("127.0.0.1", 0), _QSUploadHandler) as proxy:
+        proxy.destination = destination
+        proxy.daemon_threads = True
+        worker = threading.Thread(target=proxy.serve_forever, daemon=True)
+        worker.start()
+        try:
+            return subprocess.call([
+                BINS["qs-client"], "-config", config_path,
+                "-upload-proxy", f"127.0.0.1:{proxy.server_address[1]}",
+            ])
+        finally:
+            proxy.shutdown()
+            worker.join()
+
+
 def deploy_added_engine(cfg, side, sync_link, *, benchmark_directory=None):
     role, core, flag, ext, contents, endpoint, listeners, rules = _added_engine_plan(
         cfg, side, tls_directory=benchmark_directory
@@ -1548,7 +1653,8 @@ def deploy_added_engine(cfg, side, sync_link, *, benchmark_directory=None):
     if platform.machine() not in ("x86_64", "amd64"):
         raise RuntimeError("This core requires Linux amd64.")
     if not os.access(binary, os.X_OK):
-        raise RuntimeError(f"Core missing: {binary}. See the installation section in README.md.")
+        hint = " Use --icmp-core with an authorized amd64 binary for offline installation." if engine == "icmp" else ""
+        raise FileNotFoundError(f"Core missing or not executable: {binary}.{hint}")
     if engine == "icmp" and run_cmd(["sysctl", "-n", "net.ipv4.icmp_echo_ignore_all"], check=True).stdout.strip() != "1":
         raise RuntimeError("ICMP Tunnel requires net.ipv4.icmp_echo_ignore_all=1 as documented by its installer.")
     transport = cfg["transport"]
@@ -1609,7 +1715,10 @@ def deploy_added_engine(cfg, side, sync_link, *, benchmark_directory=None):
             if cert_paths:
                 gen_self_signed_cert(f"leech-{name}", cfg.get("sni", "leech.local"), directory=benchmark_directory)
             _write_private(path, contents)
-            write_systemd(service, f"{engine} {role} ({name})", f"{binary} {flag} {path}",
+            command = f"{binary} {flag} {path}"
+            if core == "qs-client" and cfg.get("upload_proxy", QS_AUTO_UPLOAD) == QS_AUTO_UPLOAD:
+                command = f"/usr/local/bin/kerov --qs-auto-upload {path}"
+            write_systemd(service, f"{engine} {role} ({name})", command,
                           check=True, service_lines=service_lines, exec_type=True, runtime_directory=runtime_directory)
             time.sleep(0.7)
             if run_cmd(["systemctl", "is-active", service]).stdout.strip() != "active":
@@ -1635,7 +1744,7 @@ def deploy_added_engine(cfg, side, sync_link, *, benchmark_directory=None):
             for cert_path in cert_paths:
                 cert_path.unlink(missing_ok=True)
             if logs and not isinstance(error, KeyboardInterrupt):
-                raise RuntimeError(f"{error}\n{logs}") from error
+                raise RuntimeError(f"{error}. Last core messages: {_bench_log_excerpt(logs, cfg)}") from error
             raise
     return service
 
@@ -2222,7 +2331,7 @@ def wizard_dagger(name: str, iran_ip: str) -> dict:
         extra["dc6_listen"] = Prompt.ask("Iran IPv6 listen address", default="::")
         extra["dc6_server_ipv6"] = Prompt.ask("Iran Public IPv6 (for Foreign client to dial)")
     elif tr == "tun":
-        extra["tun_profile"] = Prompt.ask("TUN IPX profile", choices=["tcp", "udp", "icmp", "gre", "ipip", "bip"], default="tcp")
+        extra["tun_profile"] = Prompt.ask("TUN IPX profile", choices=DAGGER_TUN_PROFILES, default="tcp")
         if extra["tun_profile"] in ("tcp", "udp"):
             extra["tun_l4_port"] = IntPrompt.ask("Service L4 port", default=443)
         extra["foreign_ip"] = Prompt.ask("Foreign Server Real IPv4")
@@ -2522,6 +2631,8 @@ def manage_tunnels_menu():
 #  SMART BENCHMARK ENGINE (ALL 6 CORES + BROKENNODE IP-SPOOFING)
 # ==============================================================================
 
+DAGGER_TUN_BENCH_CASES = [("dagger", f"tun/{profile}", "reverse") for profile in DAGGER_TUN_PROFILES]
+
 BASE_BENCH_CASES = [
     # BrokenNode (11 standard transports; 12th 'spoof' is added when user provides White IPs)
     ("brokennode", "tcp", "reverse"),
@@ -2547,10 +2658,7 @@ BASE_BENCH_CASES = [
     ("dagger", "xhttp", "reverse"),
     ("dagger", "xhttps", "reverse"),
     ("dagger", "nova", "reverse"),
-    ("dagger", "tun/tcp", "reverse"),
-    ("dagger", "tun/udp", "reverse"),
-    ("dagger", "tun/icmp", "reverse"),
-    ("dagger", "tun/gre", "reverse"),
+    *DAGGER_TUN_BENCH_CASES,
     # Backhaul Premium (All 10 transports: tcp, tcpmux, xtcpmux, ws, wss, wsmux, wssmux, xwsmux, anytls, tun/tcp & tun/ipx)
     ("backhaul", "tcp", "reverse"),
     ("backhaul", "tcpmux", "reverse"),
@@ -2577,6 +2685,8 @@ BASE_BENCH_CASES = [
 
 BENCH_CHUNK = 65536
 BENCH_PAYLOAD_SIZE = 48 * BENCH_CHUNK
+QS_BENCH_CHUNK = 8 * 1024
+QS_BENCH_PAYLOAD_SIZE = 32 * QS_BENCH_CHUNK
 BENCH_PEER_WAIT = 300
 BENCH_CONTROL_TIMEOUT = 300
 BENCH_IO_TIMEOUT = 25
@@ -2633,9 +2743,31 @@ def _handle_bench_echo(conn, key=None):
                     _bench_read_exact(conn, BENCH_CHUNK)
                 conn.sendall(b"DONE")
                 return True
+            elif command in (b"QBLK", b"QUPL"):
+                if key is None:
+                    return False
+                _bench_qs_transfer(conn, command, deadline, receiver=True)
+                return command == b"QUPL"
         except (OSError, EOFError):
             pass
     return False
+
+
+def _bench_qs_transfer(conn, command, deadline, *, receiver):
+    sends_data = (command == b"QBLK") == receiver
+    chunk = b"K" * QS_BENCH_CHUNK
+    for _ in range(QS_BENCH_PAYLOAD_SIZE // QS_BENCH_CHUNK):
+        _bench_transfer_timeout(conn, deadline)
+        if sends_data:
+            conn.sendall(chunk)
+            _bench_transfer_timeout(conn, deadline)
+            if _bench_read_exact(conn, 1) != b"A":
+                raise OSError("Invalid benchmark block acknowledgment.")
+        else:
+            if _bench_read_exact(conn, len(chunk)) != chunk:
+                raise OSError("Invalid benchmark block contents.")
+            _bench_transfer_timeout(conn, deadline)
+            conn.sendall(b"A")
 
 
 def _start_echo_sink(port: int, stop_ev: threading.Event):
@@ -2652,7 +2784,7 @@ def _start_echo_sink(port: int, stop_ev: threading.Event):
                 continue
 
 
-def _probe_local_port(port: int, *, dial=None, key=None, on_progress=None):
+def _probe_local_port(port: int, *, dial=None, key=None, on_progress=None, on_echo_error=None, qs_transfer=False):
     if dial is None:
         def dial(timeout):
             return socket.create_connection(("127.0.0.1", port), timeout=timeout)
@@ -2669,8 +2801,10 @@ def _probe_local_port(port: int, *, dial=None, key=None, on_progress=None):
                 if _bench_read_exact(conn, 4) != b"PONG":
                     raise OSError("Invalid benchmark response.")
                 rtts.append((time.perf_counter() - t0) * 1000.0)
-        except (OSError, EOFError):
+        except (OSError, EOFError) as error:
             lost += 1
+            if on_echo_error:
+                on_echo_error(error)
         if on_progress:
             on_progress("ECHO", len(rtts))
         if lost >= 2 and not rtts:
@@ -2679,16 +2813,19 @@ def _probe_local_port(port: int, *, dial=None, key=None, on_progress=None):
 
     dl_mbps = 0.0
     ul_mbps = 0.0
-    for command, phase in ((b"BULK", "DOWNLOAD"), (b"UPLD", "UPLOAD")):
+    commands = (b"QBLK", b"QUPL") if qs_transfer else (b"BULK", b"UPLD")
+    for command, phase in zip(commands, ("DOWNLOAD", "UPLOAD")):
         if on_progress:
-            on_progress(phase, len(rtts), dl_mbps if command == b"UPLD" else None)
+            on_progress(phase, len(rtts), dl_mbps if phase == "UPLOAD" else None)
         try:
             t0 = time.perf_counter()
             with dial(10) as conn:
                 deadline = time.monotonic() + BENCH_TRANSFER_LIMIT
                 _bench_transfer_timeout(conn, deadline)
                 _bench_request(conn, command, key)
-                if command == b"BULK":
+                if qs_transfer:
+                    _bench_qs_transfer(conn, command, deadline, receiver=False)
+                elif command == b"BULK":
                     for _ in range(BENCH_PAYLOAD_SIZE // BENCH_CHUNK):
                         _bench_transfer_timeout(conn, deadline)
                         _bench_read_exact(conn, BENCH_CHUNK)
@@ -2700,8 +2837,9 @@ def _probe_local_port(port: int, *, dial=None, key=None, on_progress=None):
                     _bench_transfer_timeout(conn, deadline)
                     if _bench_read_exact(conn, 4) != b"DONE":
                         raise OSError("The peer did not acknowledge the upload.")
-            rate = (BENCH_PAYLOAD_SIZE * 8.0) / (max(time.perf_counter() - t0, 0.001) * 1_000_000.0)
-            if command == b"BULK":
+            size = QS_BENCH_PAYLOAD_SIZE if qs_transfer else BENCH_PAYLOAD_SIZE
+            rate = (size * 8.0) / (max(time.perf_counter() - t0, 0.001) * 1_000_000.0)
+            if phase == "DOWNLOAD":
                 dl_mbps = rate
             else:
                 ul_mbps = rate
@@ -2716,21 +2854,20 @@ def _probe_local_port(port: int, *, dial=None, key=None, on_progress=None):
 
 def _spawn_bench_proc(
     engine: str, transport: str, side: str, iran_ip: str, foreign_ip: str,
-    tport: int, fport: int, secret: str, tmpdir: Path, spoof_opts=None
+    tport: int, fport: int, secret: str, tmpdir: Path, spoof_opts=None, direction="reverse"
 ):
     if engine == "brokennode":
         if not os.path.exists(BINS["brokennode"]):
             return None
-        role = "server" if side == "iran" else "client"
+        server_side = "foreign" if direction == "direct" else "iran"
+        role = "server" if side == server_side else "client"
         if transport.startswith("spoof/"):
             cproto = transport.split("/", 1)[1]
             if not spoof_opts or not spoof_opts.get("w1") or not spoof_opts.get("w2"):
                 return None
             run_cmd("ip link del kspbench0 2>/dev/null || true; ip link del bhbench0 2>/dev/null || true; ip link del dcbench0 2>/dev/null || true")
-            local_ip = iran_ip if role == "server" else foreign_ip
-            peer_ip = foreign_ip if role == "server" else iran_ip
-            s_src = spoof_opts["w1"] if role == "server" else spoof_opts["w2"]
-            s_dst = spoof_opts["w2"] if role == "server" else spoof_opts["w1"]
+            local_ip, peer_ip = (iran_ip, foreign_ip) if side == "iran" else (foreign_ip, iran_ip)
+            s_src, s_dst = (spoof_opts["w1"], spoof_opts["w2"]) if side == "iran" else (spoof_opts["w2"], spoof_opts["w1"])
             tl, trr = ("10.10.29.1", "10.10.29.2") if role == "server" else ("10.10.29.2", "10.10.29.1")
             cfg = {
                 "mode": role, "transport": "spoof", "log_level": "error",
@@ -2929,8 +3066,8 @@ def _spawn_bench_proc(
         return subprocess.Popen([BINS["backhaul"], "-c", str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     if engine == "paqet":
-        if not os.path.exists(BINS["paqet"]):
-            return None
+        if not os.access(BINS["paqet"], os.X_OK):
+            raise FileNotFoundError(f"paqet-plus core missing or not executable: {BINS['paqet']}")
         role = "client" if side == "iran" else "server"
         net = detect_net_info()
         cfg = {
@@ -2949,13 +3086,6 @@ def _spawn_bench_proc(
         p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
         return subprocess.Popen([BINS["paqet"], "run", "-c", str(p)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    if engine == "kerov-udp":
-        if not os.path.exists(BINS["udp2raw"]):
-            return None
-        if side == "iran":
-            return subprocess.Popen([BINS["udp2raw"], "-c", "-l", f"127.0.0.1:{fport}", "-r", f"{foreign_ip}:{tport}", "-k", secret[:16], "--raw-mode", "faketcp", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        else:
-            return subprocess.Popen([BINS["udp2raw"], "-s", "-l", f"0.0.0.0:{tport}", "-r", f"127.0.0.1:{fport}", "-k", secret[:16], "--raw-mode", "faketcp", "-a"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return None
 
 def _load_watchdog_cfg() -> dict:
@@ -3020,7 +3150,7 @@ def _show_bench_history():
     for h in hist:
         w = h.get("winner") or h.get("measurement", {})
         method = Text(f"{w.get('engine', '-')} / {w.get('transport', '-')}")
-        if h.get("winner") and w.get("engine") == "kerov-udp":
+        if w.get("engine") == "kerov-udp" and w.get("display_status", "ESTIMATE") == "ESTIMATE":
             method.append(" · estimate", style=WARN_C)
         tbl.add_row(
             h.get("ts", "-"),
@@ -3058,7 +3188,7 @@ def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=N
         if tr.startswith("spoof/"):
             cproto = tr.split("/", 1)[1]
             cfg = {
-                "name": name, "engine": "brokennode", "direction": "reverse", "transport": "spoof",
+                "name": name, "engine": "brokennode", "direction": best["direction"], "transport": "spoof",
                 "iran_ip": iran_ip, "foreign_ip": foreign_ip,
                 "spoof_w1": spoof_opts["w1"], "spoof_w2": spoof_opts["w2"],
                 "carrier_proto": cproto, "carrier_port": 6262, "mtu": 1320, "ttl_jitter": False,
@@ -3144,8 +3274,8 @@ def _quick_deploy_winner(best: dict, iran_ip: str, foreign_ip: str, spoof_opts=N
     )
 
 
-def _socks_bench_connection(local_port, address, port, timeout):
-    conn = socket.create_connection(("127.0.0.1", local_port), timeout=timeout)
+def _socks_bench_connection(local_port, address, port, timeout, *, proxy_host="127.0.0.1"):
+    conn = socket.create_connection((proxy_host, local_port), timeout=timeout)
     try:
         conn.sendall(b"\x05\x01\x00")
         if _bench_read_exact(conn, 2) != b"\x05\x00":
@@ -3153,7 +3283,7 @@ def _socks_bench_connection(local_port, address, port, timeout):
         conn.sendall(b"\x05\x01\x00\x01" + ipaddress.IPv4Address(address).packed + port.to_bytes(2, "big"))
         header = _bench_read_exact(conn, 4)
         if header[:3] != b"\x05\x00\x00":
-            raise OSError("The tunnel SOCKS5 listener could not reach the peer echo endpoint.")
+            raise OSError(f"SOCKS5 CONNECT to {address}:{port} failed (reply {header[1]}).")
         if header[3] == 3:
             address_size = _bench_read_exact(conn, 1)[0]
         else:
@@ -3167,8 +3297,32 @@ def _socks_bench_connection(local_port, address, port, timeout):
         raise
 
 
-def _managed_bench_path(tunnel, cfg):
+def _bind_bench_device(sock, device):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,15}", device):
+        raise ValueError("Invalid TUN interface name.")
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, os.fsencode(device) + b"\0")
+
+
+def _dial_bench_tun(device, source, target, port, timeout):
+    conn = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        _bind_bench_device(conn, device)
+        conn.settimeout(timeout)
+        conn.bind((source, 0))
+        conn.connect((target, port))
+        return conn
+    except (OSError, ValueError, KeyboardInterrupt):
+        conn.close()
+        raise
+
+
+def _managed_bench_path(tunnel, cfg, *, dagger_tun=None):
     engine, role = tunnel["engine"], tunnel["role"]
+    if dagger_tun is not None:
+        source = str(ipaddress.IPv4Interface(dagger_tun["local_addr"]).ip)
+        target = str(ipaddress.IPv4Interface(dagger_tun["remote_addr"]).ip)
+        echo_port = _added_port({"port": IntPrompt.ask("Unused peer TUN echo TCP port", default=49500)}, "port")
+        return target, echo_port, lambda timeout: _dial_bench_tun(dagger_tun["name"], source, target, echo_port, timeout)
     if engine in ("qs", "icmp"):
         if role != "client":
             raise ValueError("Start the benchmark from this tunnel's SOCKS5 client.")
@@ -3214,6 +3368,8 @@ def _serve_managed_benchmark(cfg):
     key = bytes.fromhex(_added_secret(cfg["secret"], 64))
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if cfg.get("echo_iface"):
+            _bind_bench_device(server, cfg["echo_iface"])
         server.bind((str(address), port))
         server.listen(8)
         console.print(f"[green]Peer echo ready on {address}:{port}.[/] Waiting up to 5 minutes.")
@@ -3241,12 +3397,16 @@ ADDED_BENCH_CASES = [
 ] + [("qs", transport, "direct") for transport in QS_TRANSPORTS] + [("icmp", "icmp", "direct")]
 
 MATRIX_BENCH_CASES = BASE_BENCH_CASES + ADDED_BENCH_CASES
+SYNCHRONIZED_BENCH_CASES = [
+    case for case in BASE_BENCH_CASES
+    if case[0] in ("backhaul", "paqet", "kerov-udp") or case[:2] in (("brokennode", "quic"), ("brokennode", "quicd"))
+]
 
-BENCH_SETUP_ERRORS = (OSError, ValueError, TypeError, KeyError, RuntimeError, subprocess.CalledProcessError)
+BENCH_SETUP_ERRORS = (OSError, EOFError, ValueError, TypeError, KeyError, RuntimeError, subprocess.CalledProcessError)
 
 
 def _temporary_bench_config(case, iran_ip, foreign_ip, tport, fport, secret, options):
-    if case not in ADDED_BENCH_CASES:
+    if case not in ADDED_BENCH_CASES and case not in DAGGER_TUN_BENCH_CASES and case not in SYNCHRONIZED_BENCH_CASES:
         raise ValueError("Unsupported temporary test case.")
     engine, transport, direction = case
     tport = _added_port({"port": tport}, "port")
@@ -3258,7 +3418,41 @@ def _temporary_bench_config(case, iran_ip, foreign_ip, tport, fport, secret, opt
                direction=direction, iran_ip=_added_ipv4(iran_ip), foreign_ip=_added_ipv4(foreign_ip),
                tunnel_port=tport)
     probe_side = "iran"
-    if engine == "leech":
+    if engine in ("brokennode", "backhaul", "paqet"):
+        cfg["ports"] = [{"bind": fport, "target": fport, "proto": "tcp"}]
+        cfg["token"] = digest.hex()[:32]
+        cfg["extra"] = {"foreign_ip": cfg["foreign_ip"]}
+        if engine == "brokennode":
+            cfg.update(preset=(10, "fast", 10, 3))
+            cfg["extra"]["alpn"] = "h3"
+        if engine == "paqet":
+            cfg["key"] = digest.hex()
+        if transport.startswith("tun/"):
+            subnet = f"10.248.{digest[16]}"
+            host = digest[17] & 252
+            profile = transport.removeprefix("tun/ipx-") if transport.startswith("tun/ipx-") else ""
+            cfg.update(transport="tun", iran_tun=f"{subnet}.{host + 1}", foreign_tun=f"{subnet}.{host + 2}",
+                       psk=base64.b64encode(digest).decode("ascii"), ports=[])
+            cfg["extra"].update(tun_name=f"bhb{digest.hex()[:12]}", tun_encapsulation="ipx" if profile else "tcp",
+                                ipx_profile=profile, tun_iran_cidr=cfg["iran_tun"] + "/30",
+                                tun_foreign_cidr=cfg["foreign_tun"] + "/30", tun_health_port=tport + 1000)
+    elif engine == "kerov-udp":
+        prefix = f"10.249.{digest[16]}"
+        host = digest[17] & 252
+        cfg.update(
+            iran_tun=f"{prefix}.{host + 1}", foreign_tun=f"{prefix}.{host + 2}",
+            wg_port=tport + 1000, mtu=1280,
+            psk=hmac.digest(digest, b"udp2raw", "sha256").hex()[:32],
+            extra={"tun_name": f"kwb{digest.hex()[:12]}"},
+        )
+    elif engine == "dagger":
+        prefix = f"10.247.{digest[16]}"
+        host = digest[17] & 252
+        cfg.update(transport="tun", psk=digest.hex(), profile_id=cfg["name"], ports=[],
+                   iran_tun=f"{prefix}.{host + 1}", foreign_tun=f"{prefix}.{host + 2}",
+                   extra=dict(tun_name=f"dcb{digest.hex()[:12]}", foreign_ip=cfg["foreign_ip"],
+                              tun_profile=transport.split("/")[1], tun_l4_port=tport))
+    elif engine == "leech":
         probe_side = "iran" if direction == "reverse" else "foreign"
         cfg.update(token=digest.hex()[:48], psk=base64.b64encode(digest).decode("ascii"),
                    license_key=options.get("license_key", LEECH_LICENSE),
@@ -3272,7 +3466,7 @@ def _temporary_bench_config(case, iran_ip, foreign_ip, tport, fport, secret, opt
                        foreign_tun_cidr=f"{prefix}.{int(last) + 2}/30", ports=[])
     elif engine == "qs":
         cfg.update(socks_port=fport + 1000, download_src_port=tport + 1000, download_port=tport + 1000,
-                   upload_proxy=options.get("upload_proxy", "127.0.0.1:10808"),
+                   upload_proxy=options.get("upload_proxy", QS_AUTO_UPLOAD),
                    upload_source=options.get("upload_source") or iran_ip, psk=digest.hex())
         if transport.endswith("+spoof"):
             cfg["spoof_ip"] = options.get("qs_spoof_ip") or foreign_ip
@@ -3283,68 +3477,383 @@ def _temporary_bench_config(case, iran_ip, foreign_ip, tport, fport, secret, opt
 
 
 @contextmanager
+def _bench_echo_listener(address, port, key, *, device=None):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        deadline = time.monotonic() + (5 if device else 3)
+        while True:
+            try:
+                if device:
+                    _bind_bench_device(listener, device)
+                listener.bind((address, port))
+                break
+            except OSError as error:
+                if error.errno not in (errno.ENODEV, errno.EADDRNOTAVAIL) or time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.15)
+        listener.listen(8)
+        listener.settimeout(0.25)
+        stop = threading.Event()
+
+        def echo():
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    return
+                _handle_bench_echo(conn, key)
+
+        worker = threading.Thread(target=echo, daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            worker.join(timeout=0.4)
+
+
+@contextmanager
 def _temporary_bench_endpoint(cfg, side, probe_side, fport, key, tmpdir):
+    if cfg["engine"] == "kerov-udp":
+        with _kerov_udp_bench_endpoint(cfg, side, fport, key, tmpdir) as detail:
+            yield detail
+        return
+    if cfg["engine"] in ("dagger", "backhaul", "brokennode", "paqet"):
+        with _process_bench_endpoint(cfg, side, fport, key, tmpdir) as log_path:
+            yield lambda: _bench_core_log(log_path, cfg)
+        return
     with tempfile.TemporaryDirectory(prefix="endpoint-", dir=tmpdir) as directory:
         service = deploy_added_engine(cfg, side, "", benchmark_directory=Path(directory))
         try:
+            def detail():
+                journal = run_cmd(["journalctl", "-u", service, "-n", "6", "--no-pager", "-o", "cat"])
+                return _bench_log_excerpt(journal.stdout, cfg)
             if side == probe_side:
-                yield
+                yield detail
                 return
             address = "127.0.0.1"
+            device = None
             if cfg["transport"] == "tun":
                 address = str(ipaddress.IPv4Interface(cfg[f"{side}_tun_cidr"]).ip)
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
-                listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                deadline = time.monotonic() + 3
-                while True:
-                    try:
-                        listener.bind((address, fport))
-                        break
-                    except OSError as error:
-                        if error.errno != errno.EADDRNOTAVAIL or time.monotonic() >= deadline:
-                            raise
-                        time.sleep(0.15)
-                listener.listen(8)
-                listener.settimeout(0.25)
-                stop = threading.Event()
-
-                def echo():
-                    while not stop.is_set():
-                        try:
-                            conn, _ = listener.accept()
-                        except socket.timeout:
-                            continue
-                        except OSError:
-                            return
-                        _handle_bench_echo(conn, key)
-
-                worker = threading.Thread(target=echo, daemon=True)
-                worker.start()
-                try:
-                    yield
-                finally:
-                    stop.set()
-                    worker.join(timeout=0.4)
+                device = _leech_tun_device(cfg["name"])
+            with _bench_echo_listener(address, fport, key, device=device):
+                yield detail
         finally:
             run_cmd(["systemctl", "stop", service])
             (BENCH_RUNTIME_DIR / f"{service}.service").unlink(missing_ok=True)
             run_cmd(["systemctl", "daemon-reload"])
 
 
-def _probe_temporary_bench(cfg, side, fport, key, progress):
+def _kerov_udp_bench_command(command, label, *, input_text=None):
+    try:
+        result = subprocess.run(command, input=input_text, capture_output=True, text=True, timeout=10)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(f"{label}: timed out.") from error
+    if result.returncode:
+        detail = result.stderr.strip().splitlines()
+        raise RuntimeError(f"{label}: {detail[0] if detail else f'exit code {result.returncode}'}")
+    return result.stdout.strip()
+
+
+def _validate_bench_wg_key(key):
+    if (not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9+/]{43}=", key)
+            or len(base64.b64decode(key, validate=True)) != 32):
+        raise ValueError("Invalid WireGuard benchmark key.")
+    return key
+
+
+def _kerov_udp_bench_keys():
+    wg = BINS["wg"]
+    if not os.access(wg, os.X_OK):
+        raise FileNotFoundError("wireguard-tools (wg) is required on both servers.")
+    private = _validate_bench_wg_key(_kerov_udp_bench_command([wg, "genkey"], "WireGuard key generation failed"))
+    public = _validate_bench_wg_key(
+        _kerov_udp_bench_command([wg, "pubkey"], "WireGuard public key generation failed", input_text=private + "\n")
+    )
+    return private, public
+
+
+@contextmanager
+def _kerov_udp_bench_endpoint(cfg, side, fport, key, tmpdir):
+    binary = BINS["udp2raw"]
+    if not os.access(binary, os.X_OK):
+        raise FileNotFoundError(f"udp2raw core missing or not executable on {side}: {binary}")
+    ip = shutil.which("ip")
+    firewall = shutil.which("iptables")
+    if not ip or not firewall:
+        raise FileNotFoundError(f"iproute2 and iptables are required on {side} for the Kerov-UDP benchmark.")
+    private = _validate_bench_wg_key(cfg["wg_private"])
+    public = _validate_bench_wg_key(cfg["wg_peer"])
+    server = side == "foreign"
+    peer_side = "iran" if server else "foreign"
+    source, peer = cfg[f"{side}_tun"], cfg[f"{peer_side}_tun"]
+    device = cfg["extra"]["tun_name"]
+    port, wg_port = cfg["tunnel_port"], cfg["wg_port"]
+    listeners = [("udp", wg_port)]
+    if server:
+        listeners.append(("tcp", port))
+    _check_added_listeners(listeners)
+    if server:
+        carrier = ["-s", f"-l 0.0.0.0:{port}", f"-r 127.0.0.1:{wg_port}"]
+        packet_match = ["--dport", str(port)]
+    else:
+        carrier = ["-c", f"-l 127.0.0.1:{wg_port}", f"-r {cfg['foreign_ip']}:{port}"]
+        packet_match = ["--sport", str(port)]
+    # Let udp2raw receive raw packets while preventing kernel TCP resets for this case only.
+    rule = ["INPUT", "-p", "tcp", "-s", f"{cfg[f'{peer_side}_ip']}/32", *packet_match,
+            "-m", "comment", "--comment", cfg["name"], "-j", "DROP"]
+    carrier.extend([f"-k {cfg['psk']}", "--raw-mode faketcp", "--cipher-mode aes128cbc", "--auth-mode hmac_sha1"])
+    with tempfile.TemporaryDirectory(prefix="wireguard-", dir=tmpdir) as directory, ExitStack() as cleanup:
+        directory = Path(directory)
+        private_path, raw_path, log_path = (directory / name for name in ("private.key", "udp2raw.conf", "udp2raw.log"))
+        _write_private(private_path, private)
+        _write_private(raw_path, "\n".join(carrier))
+        _write_private(log_path, "")
+        _kerov_udp_bench_command([ip, "link", "add", "dev", device, "type", "wireguard"],
+                                 f"Cannot create kernel WireGuard interface on {side}")
+        cleanup.callback(run_cmd, [ip, "link", "delete", "dev", device])
+        command = [BINS["wg"], "set", device, "private-key", str(private_path)]
+        if server:
+            command.extend(["listen-port", str(wg_port)])
+        command.extend(["peer", public, "allowed-ips", f"{peer}/32"])
+        if not server:
+            command.extend(["endpoint", f"127.0.0.1:{wg_port}", "persistent-keepalive", "5"])
+        _kerov_udp_bench_command(command, f"Cannot configure WireGuard on {side}")
+        _kerov_udp_bench_command([ip, "address", "add", f"{source}/32", "dev", device],
+                                 f"Cannot assign WireGuard address on {side}")
+        _kerov_udp_bench_command([firewall, "-w", "5", "-I", *rule],
+                                 f"Cannot add temporary udp2raw firewall rule on {side}")
+        cleanup.callback(run_cmd, [firewall, "-w", "5", "-D", *rule])
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, "--conf-file", str(raw_path)], stdout=log, stderr=subprocess.STDOUT)
+        try:
+            time.sleep(0.45)
+            if proc.poll() is not None:
+                raise RuntimeError(f"udp2raw exited on {side} (code {proc.returncode}). {_bench_core_log(log_path, cfg)}")
+            _kerov_udp_bench_command([ip, "link", "set", "dev", device, "mtu", str(cfg["mtu"]), "up"],
+                                     f"Cannot bring up WireGuard on {side}")
+            _kerov_udp_bench_command([ip, "route", "add", f"{peer}/32", "dev", device],
+                                     f"Cannot add WireGuard peer route on {side}")
+
+            def detail():
+                handshakes = run_cmd([BINS["wg"], "show", device, "latest-handshakes"])
+                established = any(re.search(r"\s[1-9][0-9]*$", line) for line in handshakes.stdout.splitlines())
+                state = "WireGuard handshake seen" if established else "No WireGuard handshake"
+                return f"{state}. {_bench_core_log(log_path, cfg)}".strip()
+
+            if server:
+                with _bench_echo_listener(source, fport, key, device=device):
+                    yield detail
+            else:
+                yield detail
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+
+def _paqet_bench_route(peer):
+    route = run_cmd(["ip", "-j", "-4", "route", "get", peer], check=True)
+    routes = json.loads(route.stdout)
+    info = routes[0] if routes else {}
+    device = info.get("dev", "")
+    if not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,15}", device) or device == "lo" or not info.get("prefsrc"):
+        raise RuntimeError(f"paqet-plus needs an IPv4 Ethernet route to {peer}.")
+    next_hop = info.get("gateway", peer)
+    for attempt in range(2):
+        neighbors = run_cmd(["ip", "-j", "-4", "neigh", "show", "to", next_hop, "dev", device], check=True)
+        for entry in json.loads(neighbors.stdout):
+            mac = entry.get("lladdr", "")
+            if re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", mac) and mac != "00:00:00:00:00:00":
+                return device, info["prefsrc"], mac
+        if attempt == 0:
+            run_cmd(["ping", "-4", "-c", "1", "-W", "1", "-I", device, next_hop])
+    raise RuntimeError(f"paqet-plus could not find the Ethernet MAC of {next_hop} on {device}.")
+
+
+def _paqet_bench_config(cfg, side, fport, cleanup):
+    server = side == "foreign"
+    peer = cfg["iran_ip"] if server else cfg["foreign_ip"]
+    interface, source, mac = _paqet_bench_route(peer)
+    port = cfg["tunnel_port"]
+    document = {
+        "role": "server" if server else "client", "log": {"level": "info"},
+        "network": {"interface": interface, "ipv4": {
+            "addr": f"{source}:{port if server else 0}", "router_mac": mac,
+        }, "pcap": {"sockbuf": 16777216}},
+        "transport": {"protocol": "kcp", "conn": 4, "kcp": {
+            "mode": cfg["transport"], "mtu": 1250, "key": cfg["key"], "block": "aes-128-gcm",
+            "sndwnd": 1024, "rcvwnd": 1024, "dshard": 0, "pshard": 0,
+        }},
+    }
+    if not server:
+        document["server"] = {"addr": f"{peer}:{port}"}
+        document["forward"] = [{"listen": f"127.0.0.1:{fport}", "target": f"127.0.0.1:{fport}", "protocol": "tcp"}]
+        return document
+
+    _check_added_listeners([("tcp", port)])
+    if not shutil.which("iptables"):
+        raise FileNotFoundError("iptables is required on Foreign for the paqet-plus benchmark.")
+    for table, chain, peer_match, port_match, flags, target in (
+        ("raw", "PREROUTING", "-s", "--dport", [], "NOTRACK"),
+        ("raw", "OUTPUT", "-d", "--sport", [], "NOTRACK"),
+        ("mangle", "OUTPUT", "-d", "--sport", ["--tcp-flags", "RST", "RST"], "DROP"),
+    ):
+        command = ["iptables", "-w", "5", "-t", table]
+        rule = [chain, "-p", "tcp", peer_match, f"{peer}/32", port_match, str(port), *flags,
+                "-m", "comment", "--comment", cfg["name"], "-j", target]
+        result = run_cmd([*command, "-I", *rule])
+        if result.returncode:
+            detail = result.stderr.strip().splitlines()
+            raise RuntimeError(f"paqet-plus firewall setup failed on {side}: {detail[0] if detail else table + ' ' + chain}")
+        cleanup.callback(run_cmd, [*command, "-D", *rule])
+    return document
+
+
+def _bench_log_excerpt(contents, cfg):
+    contents = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", contents)
+    for field in ("psk", "key", "token", "license_key"):
+        if cfg.get(field):
+            contents = contents.replace(str(cfg[field]), "<redacted>")
+    return " ".join(contents.strip().splitlines()[-2:])[-180:]
+
+
+def _bench_core_log(log_path, cfg):
+    with log_path.open("rb") as log:
+        log.seek(max(0, log_path.stat().st_size - 4096))
+        return _bench_log_excerpt(log.read().decode(errors="replace"), cfg)
+
+
+@contextmanager
+def _process_bench_endpoint(cfg, side, fport, key, tmpdir):
+    engine = cfg["engine"]
+    binary = BINS[engine]
+    if not os.access(binary, os.X_OK):
+        raise FileNotFoundError(f"{engine} core missing or not executable on {side}: {binary}")
+    tun = cfg["transport"] == "tun"
+    device = cfg["extra"]["tun_name"] if tun else None
+    if tun and not os.access("/dev/net/tun", os.R_OK | os.W_OK):
+        raise OSError(f"{engine} TUN requires /dev/net/tun on {side}.")
+    if device and Path("/sys/class/net", device).exists():
+        raise RuntimeError(f"Benchmark TUN interface {device} already exists on {side}.")
+    with ExitStack() as cleanup:
+        env = None
+        extra_args = []
+        extension = "json"
+        if engine == "dagger":
+            other = "foreign" if side == "iran" else "iran"
+            role, doc = _dagger_config(cfg, side, tun_addresses=(cfg[f"{side}_tun"], cfg[f"{other}_tun"]))
+            contents = json.dumps(doc)
+            env = dict(os.environ, DC_CHANNEL="offline", DC_VERSION="v4.3.1")
+            if role == "server":
+                env["DC_SERVER_PUBLIC_IP"] = cfg["iran_ip"]
+        elif engine == "brokennode":
+            _, doc = _brokennode_config(cfg, side)
+            contents = json.dumps(doc)
+        elif engine == "backhaul":
+            _, contents = _backhaul_config(cfg, side, tls_directory=tmpdir)
+            extension = "toml"
+        else:
+            contents = yaml.safe_dump(_paqet_bench_config(cfg, side, fport, cleanup), sort_keys=False)
+            extra_args = ["run"]
+            extension = "yaml"
+        path = tmpdir / f"{cfg['name']}.{extension}"
+        log_path = path.with_suffix(".log")
+        _write_private(path, contents)
+        _write_private(log_path, "")
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen([binary, *extra_args, "-c", str(path)], env=env, stdout=log, stderr=subprocess.STDOUT)
+        try:
+            deadline = time.monotonic() + 15
+            if not tun:
+                time.sleep(0.45)
+            while True:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"{engine} exited on {side} (code {proc.returncode}).")
+                if not tun or Path("/sys/class/net", device).exists():
+                    break
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"{engine} did not create {device} on {side}.")
+                time.sleep(0.15)
+            if side == "foreign":
+                address = cfg[f"{side}_tun"] if tun else "127.0.0.1"
+                with _bench_echo_listener(address, fport, key, device=device):
+                    yield log_path
+            else:
+                yield log_path
+        except (OSError, RuntimeError) as error:
+            raise RuntimeError(f"{error} {_bench_core_log(log_path, cfg)}".strip()) from error
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+            if device and Path("/sys/class/net", device).exists():
+                run_cmd(["ip", "link", "delete", "dev", device, "type", "tun"])
+
+
+def _probe_temporary_bench(cfg, side, fport, key, progress, on_echo_error=None):
     address = "127.0.0.1"
-    if cfg["engine"] in ("qs", "icmp"):
+    engine = cfg["engine"]
+    if cfg["transport"] == "tun" or engine == "kerov-udp":
+        peer = "foreign" if side == "iran" else "iran"
+        if engine == "leech":
+            source = str(ipaddress.IPv4Interface(cfg[f"{side}_tun_cidr"]).ip)
+            address = str(ipaddress.IPv4Interface(cfg[f"{peer}_tun_cidr"]).ip)
+            device = _leech_tun_device(cfg["name"])
+        else:
+            source, address = cfg[f"{side}_tun"], cfg[f"{peer}_tun"]
+            device = cfg["extra"]["tun_name"]
+
+        def dial(timeout):
+            return _dial_bench_tun(device, source, address, fport, timeout)
+    elif engine in ("qs", "icmp"):
         def dial(timeout):
             return _socks_bench_connection(cfg["socks_port"], address, fport, timeout)
     else:
-        if cfg["transport"] == "tun":
-            peer = "foreign" if side == "iran" else "iran"
-            address = str(ipaddress.IPv4Interface(cfg[f"{peer}_tun_cidr"]).ip)
-
         def dial(timeout):
             return socket.create_connection((address, fport), timeout=timeout)
 
-    return _probe_local_port(fport, dial=dial, key=key, on_progress=progress)
+    deadline = time.monotonic() + (35 if engine == "kerov-udp" else 25)
+    while True:
+        try:
+            with dial(3) as conn:
+                _bench_request(conn, b"PING", key)
+                if _bench_read_exact(conn, 4) != b"PONG":
+                    raise OSError("Unexpected benchmark echo reply.")
+            break
+        except (OSError, EOFError) as error:
+            if time.monotonic() >= deadline:
+                if on_echo_error:
+                    on_echo_error(error)
+                return None
+            time.sleep(0.25)
+    return _probe_local_port(fport, dial=dial, key=key, on_progress=progress,
+                             on_echo_error=on_echo_error, qs_transfer=engine == "qs")
+
+
+def _check_qs_bench_upload(cfg):
+    address, port = cfg["foreign_ip"], cfg["tunnel_port"]
+    proxy = _qs_proxy_address(cfg["upload_proxy"])
+    try:
+        if proxy == QS_AUTO_UPLOAD:
+            with socket.create_connection((address, port), timeout=5):
+                pass
+        else:
+            host, _, proxy_port = proxy.rpartition(":")
+            with _socks_bench_connection(int(proxy_port), address, port, 5, proxy_host=host):
+                pass
+    except (OSError, EOFError) as error:
+        raise OSError(f"QS upload TCP to {address}:{port} via {proxy} failed: {error}") from error
 
 
 def _send_bench_message(conn, payload):
@@ -3368,47 +3877,136 @@ def _read_bench_message(conn, *, limit=4096):
     return message
 
 
+
+def _read_peer_bench_metrics(conn, board, idx, *, on_failure=None):
+    while True:
+        message = _read_bench_message(conn)
+        if "result" in message:
+            metrics = message["result"]
+            if metrics is None and on_failure and isinstance(message.get("detail"), str):
+                on_failure(message["detail"][:240])
+            break
+        phase, echoes = message.get("phase"), message.get("echoes")
+        if phase not in ("ECHO", "DOWNLOAD", "UPLOAD") or type(echoes) is not int or not 0 <= echoes <= 5:
+            raise ValueError("Invalid benchmark progress from peer.")
+        down = message.get("down")
+        if down is not None and (type(down) not in (int, float) or not 0 <= down <= 1000000):
+            raise ValueError("Invalid download sample from peer.")
+        board.probe(idx, phase, echoes, down)
+    fields = ("mbps", "ul_mbps", "rtt", "jitter", "loss")
+    if metrics is not None and (not isinstance(metrics, dict) or set(metrics) != set(fields)
+            or any(type(v) not in (int, float) or not 0 <= v <= 1000000 for v in metrics.values())
+            or metrics["loss"] > 100):
+        raise ValueError("Invalid benchmark result from peer.")
+    return metrics
+
+
+def _brokennode_direct_echo_key(secret, fport):
+    return hmac.digest(bytes.fromhex(secret), f"brokennode/direct/{fport}".encode(), "sha256")
+
+
+def _run_brokennode_direct_bench(conn, transport, iran_ip, foreign_ip, tport, fport, secret, tmpdir, spoof_opts, board, idx):
+    proc = None
+    peer_started = False
+    try:
+        with _bench_echo_listener("127.0.0.1", fport, _brokennode_direct_echo_key(secret, fport)):
+            proc = _spawn_bench_proc("brokennode", transport, "iran", iran_ip, foreign_ip, tport, fport,
+                                     secret, tmpdir, spoof_opts=spoof_opts, direction="direct")
+            if not proc:
+                return None, "START FAIL", "BrokenNode core missing on Iran or source addresses unavailable."
+            _send_bench_message(conn, {"action": "start-brokennode-direct", "transport": transport,
+                                       "tport": tport, "fport": fport})
+            peer_started = True
+            ready = _read_bench_message(conn)
+            if not ready.get("ready"):
+                return None, "SKIPPED", str(ready.get("error", "Foreign setup failed."))[:240]
+            board.mark(idx, "WARMUP")
+            time.sleep(3)
+            if proc.poll() is not None:
+                return None, "START FAIL", "BrokenNode exited on Iran during warmup."
+            _send_bench_message(conn, {"action": "probe-brokennode-direct"})
+            metrics = _read_peer_bench_metrics(conn, board, idx)
+            return metrics, _bench_outcome(metrics) if metrics else "NO ECHO", ""
+    except BENCH_SETUP_ERRORS as error:
+        return None, "START FAIL", str(error).splitlines()[0][:240]
+    finally:
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if proc:
+            run_cmd(["ip", "link", "del", "kspbench0"])
+        if peer_started:
+            _send_bench_message(conn, {"action": "stop"})
+            _read_bench_line(conn, limit=128)
+
+
 def _run_added_bench(conn, case, iran_ip, foreign_ip, tport, fport, secret, options, tmpdir, board, idx):
     cfg, probe_side, key = _temporary_bench_config(case, iran_ip, foreign_ip, tport, fport, secret, options)
     peer_options = {key: value for key, value in options.items() if key != "license_key"}
+    wireguard = cfg["engine"] == "kerov-udp"
+    if wireguard:
+        try:
+            cfg["wg_private"], peer_options["wg_public"] = _kerov_udp_bench_keys()
+        except FileNotFoundError as error:
+            return None, "SKIPPED", f"Iran: {error}"
+        except BENCH_SETUP_ERRORS as error:
+            return None, "START FAIL", f"Iran: {error}"
     _send_bench_message(conn, {"action": "start-temporary", "case": case, "foreign_ip": foreign_ip,
                                "tport": tport, "fport": fport, "options": peer_options})
     with ExitStack() as local:
+        ready = _read_bench_message(conn) if wireguard else None
         setup_error = ""
+        local_detail = None
         try:
-            local.enter_context(_temporary_bench_endpoint(cfg, "iran", probe_side, fport, key, tmpdir))
+            if wireguard and ready.get("ready"):
+                cfg["wg_peer"] = _validate_bench_wg_key(ready.get("wg_public"))
+            if not wireguard or ready.get("ready"):
+                local_detail = local.enter_context(_temporary_bench_endpoint(cfg, "iran", probe_side, fport, key, tmpdir))
+        except FileNotFoundError as error:
+            setup_error = str(error).splitlines()[0][:240]
+            local_status = "SKIPPED"
         except BENCH_SETUP_ERRORS as error:
             setup_error = str(error).splitlines()[0][:240]
-        ready = _read_bench_message(conn)
+            local_status = "START FAIL"
+        if not wireguard:
+            ready = _read_bench_message(conn)
         if not ready.get("ready"):
-            return None, "SKIPPED", str(ready.get("error", "Peer setup failed."))[:240]
+            return None, "SKIPPED" if ready.get("missing") else "START FAIL", str(ready.get("error", "Peer setup failed."))[:240]
         try:
             if setup_error:
-                return None, "START FAIL", setup_error
+                return None, local_status, setup_error
             board.mark(idx, "WARMUP")
             time.sleep(2.2)
+            echo_errors = []
+            if cfg["engine"] == "qs":
+                _check_qs_bench_upload(cfg)
             if probe_side == "iran":
-                metrics = _probe_temporary_bench(cfg, "iran", fport, key, lambda *event: board.probe(idx, *event))
+                metrics = _probe_temporary_bench(
+                    cfg, "iran", fport, key, lambda *event: board.probe(idx, *event),
+                    on_echo_error=echo_errors.append,
+                )
             else:
                 _send_bench_message(conn, {"action": "probe-temporary"})
-                while True:
-                    message = _read_bench_message(conn)
-                    if "result" in message:
-                        metrics = message["result"]
-                        break
-                    phase, echoes = message.get("phase"), message.get("echoes")
-                    if phase not in ("ECHO", "DOWNLOAD", "UPLOAD") or type(echoes) is not int or not 0 <= echoes <= 5:
-                        raise ValueError("Invalid benchmark progress from peer.")
-                    down = message.get("down")
-                    if down is not None and (type(down) not in (int, float) or not 0 <= down <= 1000000):
-                        raise ValueError("Invalid download sample from peer.")
-                    board.probe(idx, phase, echoes, down)
-                fields = ("mbps", "ul_mbps", "rtt", "jitter", "loss")
-                if metrics is not None and (not isinstance(metrics, dict) or set(metrics) != set(fields)
-                        or any(type(v) not in (int, float) or not 0 <= v <= 1000000 for v in metrics.values())
-                        or metrics["loss"] > 100):
-                    raise ValueError("Invalid benchmark result from peer.")
-            return metrics, _bench_outcome(metrics) if metrics else "NO ECHO", ""
+                metrics = _read_peer_bench_metrics(conn, board, idx, on_failure=echo_errors.append)
+            note = ""
+            if not metrics and echo_errors:
+                error = echo_errors[-1]
+                if cfg["engine"] == "qs" and isinstance(error, TimeoutError):
+                    note = f"QS upload TCP reachable, but echo timed out. Check Iran inbound UDP {cfg['download_port']}."
+                else:
+                    note = f"{case[0]}/{case[1]} echo at TCP {fport} failed: {error}"
+                info = local_detail() if local_detail else ""
+                if info:
+                    note += f" · Iran core: {info}"
+                _send_bench_message(conn, {"action": "temporary-diagnostics"})
+                peer_detail = _read_bench_message(conn).get("detail", "")
+                if isinstance(peer_detail, str) and peer_detail:
+                    note += f" · Foreign core: {peer_detail[:180]}"
+            return metrics, _bench_outcome(metrics) if metrics else "NO ECHO", note
         except BENCH_SETUP_ERRORS as error:
             return None, "START FAIL", str(error).splitlines()[0][:240]
         finally:
@@ -3419,7 +4017,7 @@ def _run_added_bench(conn, case, iran_ip, foreign_ip, tport, fport, secret, opti
 BENCH_STATUS_COLORS = {
     "QUEUED": MUTED, "SETUP": ACCENT, "WARMUP": ACCENT, "ECHO": WARN_C,
     "DOWNLOAD": OK_C, "UPLOAD": OK_C, "OK": OK_C, "UNSTABLE": WARN_C,
-    "NO ECHO": BAD_C, "START FAIL": BAD_C, "SKIPPED": MUTED, "ESTIMATE": WARN_C,
+    "NO ECHO": BAD_C, "START FAIL": BAD_C, "SKIPPED": MUTED,
 }
 
 
@@ -3455,7 +4053,7 @@ class BenchmarkBoard:
     def mark(self, index, status, **data):
         self.current = index
         self.rows[index].update(status=status, **data)
-        if status in ("OK", "UNSTABLE", "NO ECHO", "START FAIL", "SKIPPED", "ESTIMATE"):
+        if status in ("OK", "UNSTABLE", "NO ECHO", "START FAIL", "SKIPPED"):
             self.completed = index + 1
         self.live.update(self.render(), refresh=True)
 
@@ -3510,7 +4108,7 @@ def _render_bench_results(results, title="BENCHMARK RESULTS"):
         table.add_column("↓ / ↑ Mbps", justify="right")
         table.add_column("Speed")
         table.add_column("RTT / Jitter", justify="right")
-        table.add_column("Loss", justify="right")
+        table.add_column("Echo loss", justify="right")
         table.add_column("Grade", justify="right")
     else:
         table.add_column("Measurement", ratio=3)
@@ -3518,25 +4116,24 @@ def _render_bench_results(results, title="BENCHMARK RESULTS"):
         name = Text(f"{row['engine']} / {row['transport']}", style=CREAM)
         status = row["display_status"]
         grade = "—" if status in ("SKIPPED", "START FAIL") else _grade_badge(row["mbps"], row["rtt"], row["loss"])
-        rate = f"{_bench_rate(row['mbps'])} / {_bench_rate(row.get('ul_mbps', 0))}"
         failed = row["loss"] == 100
-        if failed:
-            rate = "—"
+        down, up = row["mbps"], row.get("ul_mbps", 0)
+        rate = "—" if failed else " / ".join(_bench_rate(value) if value else "Failed" for value in (down, up))
         timing = "—" if failed else f"{row['rtt']:.1f} / {row['jitter']:.1f} ms"
         bar = _speed_bar(row["mbps"], max_speed, 8)
-        loss = "—" if status in ("SKIPPED", "START FAIL") else f"{row['loss']:.0f}%"
+        loss = "—" if status in ("SKIPPED", "START FAIL", "NO ECHO") else f"{row['loss']:.0f}%"
         if wide:
             table.add_row(str(index), name, row["direction"].upper(), _bench_status(status), rate, bar, timing, loss, grade)
         else:
             name.append(f"\n{row['direction'].upper()}", style=MUTED)
             measurement = _bench_status(status)
-            stats = f"↓/↑ {rate} Mbps · RTT/jitter {timing} · Loss {loss}" if not failed else f"Loss {loss}"
+            stats = f"↓/↑ {rate} Mbps · RTT/jitter {timing} · Echo loss {loss}" if not failed else f"Echo loss {loss}"
             measurement.append(f"\n{stats}\n", style=CREAM)
             measurement.append_text(Text.from_markup(f"{bar}  {grade}"))
             table.add_row(str(index), name, measurement)
     console.print(table)
-    if any(r["display_status"] == "ESTIMATE" for r in results):
-        console.print(Text("ESTIMATE  Kerov-UDP uses preset values in the current matrix.", style=WARN_C))
+    if any(r["engine"] == "qs" and r["display_status"] in ("OK", "UNSTABLE") for r in results):
+        console.print(Text("QS rates measure acknowledged 8 KiB blocks (256 KiB per direction).", style=MUTED))
     reasons = {}
     for result in results:
         if reason := result.get("reason"):
@@ -3546,9 +4143,11 @@ def _render_bench_results(results, title="BENCHMARK RESULTS"):
 
 
 def _benchmark_managed_tunnel():
-    tunnels = [item for item in list_tunnels() if item["engine"] in (*ADDED_ENGINES, "ctunnel") and item["status"] == "active"]
+    tunnels = [item for item in list_tunnels() if item["status"] == "active"
+               and (item["engine"] in (*ADDED_ENGINES, "ctunnel")
+                    or (item["engine"] == "dagger" and item["transport"] == "tun"))]
     if not tunnels:
-        console.print("[yellow]Start a Leech, QS, ICMP or C-Tunnel instance first.[/]")
+        console.print("[yellow]Start a Dagger TUN, Leech, QS, ICMP or C-Tunnel instance first.[/]")
         pause()
         return
     for number, tunnel in enumerate(tunnels, 1):
@@ -3560,23 +4159,36 @@ def _benchmark_managed_tunnel():
     tunnel = tunnels[int(selection) - 1]
     try:
         cfg = decode_link(tunnel["sync_link"], "kerov")
-        address, port, dial = _managed_bench_path(tunnel, cfg)
+        dagger_tun = None
+        transport = tunnel["transport"]
+        if tunnel["engine"] == "dagger":
+            doc = json.loads(Path(tunnel["config"]).read_text(encoding="utf-8"))
+            dagger_tun = doc["tun"]
+            transport = f"tun/{doc['ipx']['profile']}"
+        address, port, dial = _managed_bench_path(tunnel, cfg, dagger_tun=dagger_tun)
         key = secrets.token_hex(32)
-        link = encode_link("kerov-test", {"kind": "managed", "echo_ip": address, "echo_port": port, "secret": key})
+        payload = {"kind": "managed", "echo_ip": address, "echo_port": port, "secret": key}
+        if dagger_tun is not None:
+            payload["echo_iface"] = dagger_tun["name"]
+        link = encode_link("kerov-test", payload)
         print_copyable_link("MANAGED TUNNEL BENCHMARK", link,
                             "On the peer select Smart Benchmark → Peer Agent and paste this private link.")
         if not Confirm.ask("Peer echo ready. Start the measurements?", default=False):
             return
-        case = (tunnel["engine"], tunnel["transport"], tunnel["direction"])
+        case = (tunnel["engine"], transport, tunnel["direction"])
+        echo_errors = []
         with BenchmarkBoard(f"MANAGED TEST · {tunnel['name']}", [case]) as board:
             metrics = _probe_local_port(port, dial=dial, key=bytes.fromhex(key),
-                                        on_progress=lambda *event: board.probe(0, *event))
+                                        on_progress=lambda *event: board.probe(0, *event),
+                                        on_echo_error=echo_errors.append, qs_transfer=tunnel["engine"] == "qs")
             board.mark(0, _bench_outcome(metrics) if metrics else "NO ECHO", **(metrics or {}))
         if metrics is None:
-            console.print("[red]No authenticated echo response. Check the mapping or SOCKS5 path and peer listener.[/]")
+            console.print("[red]No authenticated echo response from the peer listener.[/]")
+            if echo_errors:
+                console.print(Text(f"{transport} echo to {address}:{port} failed: {echo_errors[-1]}", style=WARN_C))
         else:
             _render_bench_results([{
-                "engine": tunnel["engine"], "transport": tunnel["transport"], "direction": tunnel["direction"],
+                "engine": tunnel["engine"], "transport": transport, "direction": tunnel["direction"],
                 "display_status": _bench_outcome(metrics), **metrics,
             }], title="MANAGED TUNNEL RESULT")
             iran = (tunnel["role"] == "iran" if tunnel["engine"] == "ctunnel"
@@ -3586,7 +4198,7 @@ def _benchmark_managed_tunnel():
                 "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "foreign_ip": peer or address,
                 "mode": "managed",
-                "measurement": {"engine": tunnel["engine"], "transport": tunnel["transport"], **metrics},
+                "measurement": {"engine": tunnel["engine"], "transport": transport, **metrics},
             })
     except (ValueError, TypeError, KeyError, OSError) as error:
         console.print(Text(f"Benchmark failed: {error}", style="red"))
@@ -3652,7 +4264,7 @@ def benchmark_menu():
         ("1", "Iran Server (Coordinator)", "Create a test link and compare transports"),
         ("2", "Peer Agent", "Join with a kerov-test:// link"),
         ("3", "Benchmark History", "Past rankings and measurements"),
-        ("4", "Benchmark Managed Tunnel", "Test a running Leech, QS, ICMP or C-Tunnel instance"),
+        ("4", "Benchmark Managed Tunnel", "Test a running Dagger TUN, Leech, QS, ICMP or C-Tunnel instance"),
         ("0", "Back to Main Menu", ""),
     ):
         console.print(_menu_cell(*option))
@@ -3716,32 +4328,44 @@ def benchmark_menu():
         if "leech" in selected_engines:
             test_options["license_key"] = Prompt.ask("Leech license key", password=True, default=LEECH_LICENSE)
         if "qs" in selected_engines:
-            test_options["upload_proxy"] = Prompt.ask("QS upload SOCKS5 on Iran", default="127.0.0.1:10808")
-            test_options["upload_source"] = Prompt.ask("QS SOCKS5 egress IPv4 as seen by Foreign", default=iran_ip)
+            test_options.update(_qs_upload_settings(iran_ip))
             test_options["qs_spoof_ip"] = Prompt.ask("QS alternate source IPv4 assigned to Foreign (blank = Foreign IP)", default="")
 
         spoof_opts = None
-        if mode_c in ("2", "3", "5") and Confirm.ask("Include BrokenNode IP-Spoofing (spoof) in benchmark?", default=False):
+        if (mode_c in ("2", "3", "4") or (mode_c == "5" and "brokennode" in selected_engines)) and Confirm.ask(
+            "Include BrokenNode IP-Spoofing (spoof) in benchmark?", default=False
+        ):
             w1 = Prompt.ask("  White IP #1 (Iran spoof source)").strip()
             w2 = Prompt.ask("  White IP #2 (Foreign spoof source)").strip()
             carriers_raw = Prompt.ask("  Spoof carriers (comma-separated)", default="udp,tcp,icmp,gre")
             carriers = [x.strip().lower() for x in carriers_raw.split(",") if x.strip().lower() in ("udp", "tcp", "icmp", "gre")]
             if w1 and w2 and carriers:
-                spoof_opts = {"w1": w1, "w2": w2}
-                for cp in carriers:
-                    bench_cases.append(("brokennode", f"spoof/{cp}", "reverse"))
+                spoof_opts = {"w1": _added_ipv4(w1), "w2": _added_ipv4(w2)}
+                directions = ("reverse", "direct") if mode_c in ("2", "5") else (mode_name,)
+                for direction in directions:
+                    for carrier in dict.fromkeys(carriers):
+                        bench_cases.append(("brokennode", f"spoof/{carrier}", direction))
                 console.print(f"  [green]✔ Added BrokenNode IP-Spoofing: {', '.join('spoof/' + x for x in carriers)}[/]")
 
         secret = secrets.token_hex(32)
         test_payload = {"iran_ip": iran_ip, "ctrl_port": ctrl_port, "secret": secret}
-        if selected_engines & set(ADDED_ENGINES):
+        if any(case in DAGGER_TUN_BENCH_CASES for case in bench_cases):
+            test_payload["dagger_tun_matrix"] = True
+        if (selected_engines & set(ADDED_ENGINES) or test_payload.get("dagger_tun_matrix")
+                or any(case in SYNCHRONIZED_BENCH_CASES for case in bench_cases)):
             test_payload["temporary_matrix"] = True
+            test_payload["synchronized_cases"] = True
+        if "kerov-udp" in selected_engines:
+            test_payload["kerov_udp_matrix"] = True
         if run_ctunnel_bench:
             test_payload["ctunnel_matrix"] = True
         if "leech" in selected_engines:
             test_payload["leech"] = True
         if spoof_opts:
             test_payload["spoof"] = spoof_opts
+            if any(engine == "brokennode" and tr.startswith("spoof/") and direction == "direct"
+                   for engine, tr, direction in bench_cases):
+                test_payload["brokennode_direct"] = True
         test_link = encode_link("kerov-test", test_payload)
 
         print_copyable_link(
@@ -3791,6 +4415,34 @@ def benchmark_menu():
                 pause()
                 return
             auth_expected += " CT1"
+        if test_payload.get("brokennode_direct"):
+            if hmac.compare_digest(auth_line, auth_expected):
+                console.print("[red]Update the Foreign server to Kerov v2.3.11 for BrokenNode Direct testing.[/]")
+                conn.close()
+                pause()
+                return
+            auth_expected += " BD1"
+        if test_payload.get("dagger_tun_matrix"):
+            if hmac.compare_digest(auth_line, auth_expected):
+                console.print("[red]Update the Foreign server to Kerov v2.3.12 for native Dagger TUN testing.[/]")
+                conn.close()
+                pause()
+                return
+            auth_expected += " DT1"
+        if test_payload.get("synchronized_cases"):
+            if hmac.compare_digest(auth_line, auth_expected):
+                console.print("[red]Update Foreign to Kerov v2.3.13 for the synchronized transport cases.[/]")
+                conn.close()
+                pause()
+                return
+            auth_expected += " MX1"
+        if test_payload.get("kerov_udp_matrix"):
+            if hmac.compare_digest(auth_line, auth_expected):
+                console.print("[red]Update Foreign to Kerov v2.3.14 for the real WireGuard benchmark.[/]")
+                conn.close()
+                pause()
+                return
+            auth_expected += " KW1"
         if not hmac.compare_digest(auth_line, auth_expected):
             console.print(f"[red]✗ Rejected unauthenticated connection from {addr[0]}.[/]")
             conn.close()
@@ -3812,10 +4464,15 @@ def benchmark_menu():
                         board.mark(idx, "SETUP")
 
                         note = ""
-                        if eng in ADDED_ENGINES:
+                        if (eng in ADDED_ENGINES or (eng, tr, direction) in DAGGER_TUN_BENCH_CASES
+                                or (eng, tr, direction) in SYNCHRONIZED_BENCH_CASES):
                             metrics, display_status, note = _run_added_bench(
                                 conn, (eng, tr, direction), iran_ip, foreign_ip, tport, fport, secret,
                                 test_options, tmpdir, board, idx,
+                            )
+                        elif eng == "brokennode" and direction == "direct" and tr.startswith("spoof/"):
+                            metrics, display_status, note = _run_brokennode_direct_bench(
+                                conn, tr, iran_ip, foreign_ip, tport, fport, secret, tmpdir, spoof_opts, board, idx,
                             )
                         else:
                             cmd = {"action": "start", "engine": eng, "transport": tr, "tport": tport, "fport": fport}
@@ -3823,6 +4480,8 @@ def benchmark_menu():
                             resp = _read_bench_line(conn, limit=128)
 
                             display_status = "SKIPPED" if resp == "SKIP" else "START FAIL"
+                            if eng == "paqet" and resp == "SKIP":
+                                note = "paqet-plus could not start on Foreign. Check Peer Agent output and the installed core."
                             metrics = None
                             proc = None
                             try:
@@ -3832,12 +4491,17 @@ def benchmark_menu():
                                 if proc:
                                     board.mark(idx, "WARMUP")
                                     time.sleep(3.0 if (tr.startswith("spoof/") or tr.startswith("tun/")) else 2.2)
-                                    if eng == "kerov-udp":
-                                        metrics = {"rtt": 35.0, "jitter": 2.0, "loss": 0.0, "mbps": 120.0, "ul_mbps": 110.0} if proc.poll() is None else None
-                                        display_status = "ESTIMATE" if metrics else "START FAIL"
+                                    if proc.poll() is not None:
+                                        note = f"{eng}/{tr} exited on Iran during startup (code {proc.returncode})."
                                     else:
-                                        metrics = _probe_local_port(fport, on_progress=lambda *event: board.probe(idx, *event))
+                                        errors = []
+                                        metrics = _probe_local_port(
+                                            fport, on_progress=lambda *event: board.probe(idx, *event),
+                                            on_echo_error=errors.append,
+                                        )
                                         display_status = _bench_outcome(metrics) if metrics else "NO ECHO"
+                                        if not metrics and errors:
+                                            note = f"{eng}/{tr} echo through local port {fport} failed: {errors[-1]}"
                             except BENCH_SETUP_ERRORS as error:
                                 note = str(error).splitlines()[0][:240]
                             finally:
@@ -3895,12 +4559,11 @@ def benchmark_menu():
             send_telegram_alert(
                 f"<b>Kerov Benchmark Complete</b> ({mode_name})\n"
                 f"Winner: <b>{best['engine'].upper()} / {best['transport']}</b>\n"
-                f"{'Estimated speed' if best['display_status'] == 'ESTIMATE' else 'Speed'}: "
+                "Speed: "
                 f"↓{best['mbps']:.1f} / ↑{best.get('ul_mbps',0):.1f} Mbps | RTT: {best['rtt']:.1f} ms"
             )
-            winner_title = "BENCHMARK WINNER · ESTIMATE" if best["display_status"] == "ESTIMATE" else "BENCHMARK WINNER"
             console.print(_cli_panel(
-                f"[bold green]{winner_title}[/] [bold white]{best['engine'].upper()}[/] → [bold cyan]{best['transport']}[/] "
+                f"[bold green]BENCHMARK WINNER[/] [bold white]{best['engine'].upper()}[/] → [bold cyan]{best['transport']}[/] "
                 f"([yellow]{best['direction'].upper()}[/]) • [bold green]↓{best['mbps']:.1f} / ↑{best.get('ul_mbps',0):.1f} Mbps[/] • [white]{best['rtt']:.1f} ms RTT[/]\n\n"
                 "[bold yellow]Press [D] for 1-Click Deploy Winner on this server, or [Enter] to return.[/]",
                 border_style="green", box=box.ROUNDED
@@ -3947,6 +4610,7 @@ def benchmark_menu():
         stop_ev = None
         temporary = ExitStack()
         test_endpoint = None
+        direct_probe_port = None
         try:
             with socket.create_connection((iran_ip, ctrl_port), timeout=15) as s:
                 auth_line = "AUTH " + hmac.new(secret.encode(), b"kerov-bench", "sha256").hexdigest()
@@ -3954,6 +4618,14 @@ def benchmark_menu():
                     auth_line += " TEMP1"
                 if cfg.get("ctunnel_matrix"):
                     auth_line += " CT1"
+                if cfg.get("brokennode_direct"):
+                    auth_line += " BD1"
+                if cfg.get("dagger_tun_matrix"):
+                    auth_line += " DT1"
+                if cfg.get("synchronized_cases"):
+                    auth_line += " MX1"
+                if cfg.get("kerov_udp_matrix"):
+                    auth_line += " KW1"
                 s.sendall((auth_line + "\n").encode())
                 s.settimeout(BENCH_CONTROL_TIMEOUT)
                 s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
@@ -3975,28 +4647,71 @@ def benchmark_menu():
                                 case, iran_ip, msg["foreign_ip"], msg["tport"], fport, secret,
                                 dict(msg["options"], license_key=local_license)
                             )
-                            temporary.enter_context(_temporary_bench_endpoint(
+                            ready = {"ready": True}
+                            if config["engine"] == "kerov-udp":
+                                if not cfg.get("kerov_udp_matrix"):
+                                    raise ValueError("This benchmark link does not support WireGuard key exchange.")
+                                config["wg_peer"] = _validate_bench_wg_key(msg["options"].get("wg_public"))
+                                config["wg_private"], ready["wg_public"] = _kerov_udp_bench_keys()
+                            detail = temporary.enter_context(_temporary_bench_endpoint(
                                 config, "foreign", probe_side, fport, case_key, tmpdir))
-                            test_endpoint = (config, probe_side, fport, case_key)
-                            _send_bench_message(s, {"ready": True})
+                            test_endpoint = (config, probe_side, fport, case_key, detail)
+                            _send_bench_message(s, ready)
                             console.print(Text(f"● READY  {case[0]} / {case[1]}", style=OK_C))
                         except BENCH_SETUP_ERRORS as error:
                             temporary.close()
-                            _send_bench_message(s, {"ready": False, "error": str(error).splitlines()[0][:240]})
+                            _send_bench_message(s, {"ready": False, "missing": isinstance(error, FileNotFoundError),
+                                                    "error": str(error).splitlines()[0][:240]})
                     elif act == "probe-temporary":
                         if test_endpoint is None or test_endpoint[1] != "foreign":
                             raise ValueError("No Foreign probe endpoint is ready.")
-                        config, _, fport, case_key = test_endpoint
+                        config, _, fport, case_key, _ = test_endpoint
 
                         def progress(phase, echoes, down=None):
                             _send_bench_message(s, {"phase": phase, "echoes": echoes, "down": down})
 
-                        measured = _probe_temporary_bench(config, "foreign", fport, case_key, progress)
-                        _send_bench_message(s, {"result": measured})
+                        errors = []
+                        measured = _probe_temporary_bench(config, "foreign", fport, case_key, progress, errors.append)
+                        _send_bench_message(s, {"result": measured, "detail": str(errors[-1])[:240] if errors else ""})
+                    elif act == "temporary-diagnostics":
+                        detail = test_endpoint[4] if test_endpoint else None
+                        _send_bench_message(s, {"detail": detail() if detail else ""})
                     elif act == "stop-temporary":
                         temporary.close()
                         test_endpoint = None
                         _send_bench_message(s, {"stopped": True})
+                    elif act == "start-brokennode-direct":
+                        try:
+                            if not cfg.get("brokennode_direct") or not spoof_opts or proc is not None:
+                                raise ValueError("No BrokenNode Direct case can be started.")
+                            tport, fport = msg["tport"], msg["fport"]
+                            if (type(tport) is not int or type(fport) is not int or
+                                    not 49200 <= tport < 49500 or fport != tport + 300):
+                                raise ValueError("Invalid BrokenNode Direct benchmark ports.")
+                            if msg["transport"] not in ("spoof/udp", "spoof/tcp", "spoof/icmp", "spoof/gre"):
+                                raise ValueError("Invalid BrokenNode Direct carrier.")
+                            _check_added_listeners([("tcp", fport)])
+                            proc = _spawn_bench_proc(
+                                "brokennode", msg["transport"], "foreign", iran_ip, foreign_ip,
+                                tport, fport, secret, tmpdir, spoof_opts=spoof_opts, direction="direct",
+                            )
+                            if not proc:
+                                raise FileNotFoundError("BrokenNode core missing on Foreign.")
+                            direct_probe_port = fport
+                            _send_bench_message(s, {"ready": True})
+                        except BENCH_SETUP_ERRORS as error:
+                            _send_bench_message(s, {"ready": False, "error": str(error).splitlines()[0][:240]})
+                    elif act == "probe-brokennode-direct":
+                        if direct_probe_port is None:
+                            raise ValueError("No BrokenNode Direct endpoint is ready.")
+
+                        def progress(phase, echoes, down=None):
+                            _send_bench_message(s, {"phase": phase, "echoes": echoes, "down": down})
+
+                        key = _brokennode_direct_echo_key(secret, direct_probe_port)
+                        measured = (_probe_local_port(direct_probe_port, key=key, on_progress=progress)
+                                    if proc.poll() is None else None)
+                        _send_bench_message(s, {"result": measured})
                     elif act == "start":
                         stop_ev = threading.Event()
                         threading.Thread(target=_start_echo_sink, args=(msg["fport"], stop_ev), daemon=True).start()
@@ -4013,6 +4728,7 @@ def benchmark_menu():
                         console.print(state)
                         s.sendall(b"OK\n" if proc else b"SKIP\n")
                     elif act == "stop":
+                        direct_probe_port = None
                         if proc:
                             proc.terminate()
                             try:
@@ -4493,7 +5209,7 @@ def _render_tunnel_list(w: int):
         line.append(f"{str(b.get('engine', '')).upper()} / {b.get('transport', '')}", style=f"bold {ACCENT}")
         line.append(f"  {mbps:.0f} Mbps · {rtt:.0f} ms · grade ", style=MUTED)
         line.append(_grade_letter(mbps, rtt), style=f"bold {CREAM}")
-        if b.get("engine") == "kerov-udp":
+        if b.get("engine") == "kerov-udp" and b.get("display_status", "ESTIMATE") == "ESTIMATE":
             line.append("  ·  estimate", style=WARN_C)
     else:
         line.append("no benchmark yet · press 03", style=MUTED)
@@ -4507,6 +5223,8 @@ def main():
     if "--watchdog" in sys.argv:
         run_watchdog_daemon()
         return
+    if len(sys.argv) == 3 and sys.argv[1] == "--qs-auto-upload":
+        sys.exit(_run_qs_auto_upload(sys.argv[2]))
 
     key_map = {
         "1": "1", "c": "1",

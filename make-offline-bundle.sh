@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 #  Kerov Tunnel — 100% Offline Bundle Builder (Run on Foreign Server)
-#  Downloads paqet-plus + udp2raw into cores/ and builds kerov-tunnel-full-offline.zip
+#  Verifies bundled paqet-plus and downloads udp2raw into cores/ and builds kerov-tunnel-full-offline.zip
 # ==============================================================================
 set -euo pipefail
 
@@ -24,21 +24,10 @@ case "$(uname -m)" in
   *) err "Unsupported arch: $(uname -m)" ;;
 esac
 
-info "Fetching latest paqet-plus ($ARCH)..."
-TAG=$(curl -fsSL --connect-timeout 15 "https://api.github.com/repos/LivingG0D/paqet-plus/releases?per_page=1" | jq -r '.[0].tag_name' 2>/dev/null || true)
-if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
-  TAG=$(curl -fsS --connect-timeout 15 -o /dev/null -w '%{redirect_url}' "https://github.com/LivingG0D/paqet-plus/releases/latest" | sed -n 's#.*/releases/tag/##p')
-fi
-[ -n "$TAG" ] || err "Could not resolve paqet-plus release tag."
+(cd "$CORES_DIR" && sha256sum -c paqet-plus-SHA256SUMS) ||
+  err "Packaged paqet-plus binaries are missing or invalid."
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-ASSET="paqet-plus-linux-${ARCH}-${TAG}.tar.gz"
-curl -fL --connect-timeout 20 -o "$TMP/$ASSET" "https://github.com/LivingG0D/paqet-plus/releases/download/${TAG}/${ASSET}"
-tar -xzf "$TMP/$ASSET" -C "$TMP"
-PQ_BIN=$(find "$TMP" -maxdepth 2 -type f -name 'paqet*' | head -1)
-[ -n "$PQ_BIN" ] || err "paqet-plus binary not found in archive."
-install -m 0755 "$PQ_BIN" "$CORES_DIR/paqet-plus"
-ok "Bundled paqet-plus ($TAG) -> cores/paqet-plus"
 
 info "Fetching latest udp2raw ($ARCH)..."
 curl -fL --connect-timeout 20 -o "$TMP/u2r.tar.gz" "https://github.com/wangyu-/udp2raw/releases/latest/download/udp2raw_binaries.tar.gz"
